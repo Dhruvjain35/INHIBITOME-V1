@@ -1,0 +1,84 @@
+# ============================================================================
+# INHIBITOME-V1 — FROZEN PILOT CONFIG
+# ============================================================================
+# Every reproducibility-critical string lives here. Do not scatter table names
+# or version numbers through the code. Changing anything under `data:` after the
+# prereg freeze (docs/02) invalidates the confirmatory run — start a new config
+# file (pilot_v2.yaml) instead of editing this one in place.
+#
+# All strings below were verified against the MICrONS tutorial / CAVE docs
+# (July 2026). See docs/01_DATA_ACCESS.md for source URLs and caveats.
+# ============================================================================
+
+data:
+  datastack: minnie65_public          # CAVEclient('minnie65_public')
+
+  # Pin ONE materialization for the whole pilot. Live public versions (Mar 2026):
+  #   117(2021) 943(2024) 1300(2025) 1507(2025) 1621(2025) 1718(2026)
+  # Expired (static download only): 343 661 795 1078 1181 1412
+  # We pin 1300 (Jan 2025): stable, well-documented, and the 2025 census +
+  # synapse-target releases are materialized in it. Bump only with a new config.
+  materialization_version: 1300
+
+  tables:
+    # --- connectivity ---
+    synapses: synapses_pni_2                       # ~337M rows; 500k/query cap
+    synapse_compartment: synapse_target_predictions_ssa   # ~204M spine/shaft/soma preds
+
+    # --- cell identity ---
+    ei_coarse: baylor_log_reg_cell_type_coarse_v1  # excitatory vs inhibitory
+    ei_meta: aibs_metamodel_celltypes_v661         # broad-coverage soma/nucleus classifier
+    mtypes: aibs_metamodel_mtypes_v661_v2          # data-driven morphological types
+    mtypes_column: allen_column_mtypes_v1          # within-V1-column m-types
+    manual_column: allen_v1_column_types_slanted_ref  # expert-curated column cells (validation)
+
+    # --- nucleus / soma / area ---
+    nucleus: nucleus_detection_v0
+    nucleus_neuron: nucleus_ref_neuron_svm
+    functional_area: nucleus_functional_area_assignment   # V1 / AL / RL / LM
+
+    # --- proofreading / QC ---
+    proofreading: proofreading_status_and_strategy
+
+    # --- functional coregistration (EM <-> two-photon) ---
+    coreg_manual: coregistration_manual_v4         # PRIMARY cohort: 15,352 roots / 19,181 ROIs
+    coreg_auto: coregistration_auto_phase3_fwd_apl_vess_combined_v2   # secondary / expansion
+    func_properties: digital_twin_properties_bcm_coreg_v4  # tuning/orientation on manual coreg
+
+  # Functional activity + behavior + repeated-movie ("oracle") stimuli are NOT
+  # in CAVE — they live in NWB on DANDI. Downloaded separately (see docs/01).
+  functional_source:
+    dandiset: "000402"                 # MICrONS two-photon functional imaging (NWB)
+    local_dir: data/raw/dandi_000402
+
+# --- Data gate (Day 3): proceed only if ALL pass (docs/03, docs/02 §6) ---
+gates:
+  min_coreg_neurons: 1000
+  min_scans: 10
+  min_neurons_with_fingerprint: 300    # "hundreds"
+  min_compartment_labeled_fraction: 0.5   # per-neuron usable compartment labels
+  retest_reliability_min: 0.30         # split-half Corr for M_i to be retained
+
+# --- Validation (docs/02 §4) ---
+validation:
+  group_key: pt_root_id                # one EM neuron -> one fold, always
+  primary_scheme: leave_one_scan_out
+  scan_key: [session, scan_idx]
+  stress_holdouts: [layer, mtype, area, spatial_block]
+  n_permutation: 1000                  # matched-null shuffles
+  n_bootstrap: 2000                    # scan-clustered / spatial-block bootstrap
+  random_seed: 20260713                # frozen (no Date.now / rng drift)
+
+# --- Compartment definitions (validated vs manual_column first; docs/00 Aim 2) ---
+compartments: [soma, proximal, distal_basal, apical, unknown]
+
+# --- Model hierarchy targets (docs/02 §2) ---
+endpoints:
+  primary: state_modulation            # M_i
+  secondary: reliability               # R_i
+
+paths:
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+  outputs: outputs

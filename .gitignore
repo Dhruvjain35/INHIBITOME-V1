@@ -1,0 +1,39 @@
+# Data (never commit raw/interim data — reproducible from the pipeline)
+data/raw/
+data/interim/
+data/processed/
+data/cache/
+*.parquet
+*.feather
+*.h5
+*.npy
+*.npz
+*.zarr
+
+# CAVE / auth secrets
+.cave-secret/
+*secret*.json
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.uv/
+.ipynb_checkpoints/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# Outputs that are regenerated (keep figures/ committed via allowlist below)
+outputs/*
+!outputs/.gitkeep
