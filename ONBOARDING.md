@@ -37,8 +37,10 @@ src/inhibitome/
   nulls/       matched-permutation / compartment / presynaptic-identity controls
   report/      Day-3 sample accounting + the DATA GATE
 scripts/00–05              Numbered, runnable pilot steps that mirror the runbook exactly.
-tests/                     Pure-logic unit tests (no network). 7/7 passing.
+tests/       test_core_logic.py      leaf functions (oracle, encoding model, fingerprints, CV)
+             test_ladder_and_nulls.py  run_ladder / run_null end-to-end + the silent-zero traps
 ```
+23/23 passing, no network required.
 
 ## Get running
 
@@ -49,7 +51,14 @@ make test             # sanity-check the pure logic offline
 make pilot            # runs scripts 01→05 in order, stopping at the first failed gate
 ```
 
-## The two things that will bite you
+No `make` on Windows? Every target is a one-liner — `uv sync --extra dev`, `uv run pytest -q`,
+`uv run python scripts/01_freeze_and_join.py`, and so on. `make token` is interactive and needs a
+real terminal; the token lands in `~/.cloudvolume/secrets/cave-secret.json`.
+
+The Days 1–2 pull transfers ~47M synapse rows and takes a while. It caches per batch, so killing it
+and re-running resumes rather than restarting. `make clean` drops the cache and forces a refetch.
+
+## The things that will bite you
 
 1. **Function is NOT in CAVE.** Anatomy (synapses, cell types, compartments, coregistration) comes from
    CAVE `minnie65_public`. Activity + behavior + repeated-movie ("oracle") stimuli come from **DANDI
@@ -59,13 +68,29 @@ make pilot            # runs scripts 01→05 in order, stopping at the first fai
    `scripts/03`.** Resolving the NWB internal schema (which TimeSeries hold locomotion/pupil, where
    `pt_root_id`/`unit_id` live, how the 10×-repeated clips are marked) must be done against a **real
    DANDI file on Day 4** — it can't be guessed from docs. That is the current frontier, not a bug.
+3. **91.4% of a neuron's incoming synapses come from orphan axon fragments with no soma.** They can
+   never be typed, so every fraction here is normalized over *typed* inputs, and `frac_typed` rides
+   along in the M0 technical block. If you ever see an inhibitory fraction near 0.05, you are looking
+   at the wrong denominator — the typed one gives ~0.6. See `fingerprints/build.py`.
+4. **`pt_root_id` cannot be filtered server-side** on the cell-type / coregistration tables — it lives
+   on the referenced nucleus table, and CAVE 500s with `KeyError: 'pt_root_id'`. `Cave.query_table`
+   filters client-side for exactly this reason.
+5. **A missing feature column does not raise.** `_columns_for` skips columns that aren't present, so an
+   absent feature block silently collapses one rung of the ladder onto the one below and reads as a
+   clean negative result. Three separate bugs of this shape have already been fixed here; if a model
+   comparison comes back suspiciously close to zero, check the columns actually exist first.
 
 ## Current status & next step
 
-Scaffold complete; plan frozen in `docs/`; unit tests green. **Nothing has touched live data yet.**
-Next real work is **Days 1–2**: `make token`, then `python scripts/01_freeze_and_join.py` to build the
-master neuron table, then the **Day-3 DATA GATE** (`scripts/02`) decides whether the pilot proceeds at
-all. If a gate fails, go straight to `docs/04_KILL_AND_SUCCESS.md` — a clean kill is a legitimate outcome.
+Scaffold complete; plan in `docs/`; **23 unit tests green**; config verified against the live API
+(all 16 tables exist at materialization **1822**). The Days 1–2 join runs end-to-end.
+
+Next real work is the **Day-3 DATA GATE** (`scripts/02`), then **Days 4–5** — which needs the DANDI
+download and the NWB schema resolved (item 2 above). If a gate fails, go straight to
+`docs/04_KILL_AND_SUCCESS.md` — a clean kill is a legitimate outcome.
+
+Cohort as measured: **19,181 ROIs / 15,434 roots / 16 scans**, comfortably past the gate's ≥1,000
+neurons and ≥10 scans. Median typed inhibitory input is ~129 synapses/neuron.
 
 ## Ground rules (from the pre-registration)
 

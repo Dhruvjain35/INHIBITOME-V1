@@ -90,5 +90,18 @@ confirmatory endpoints.
 
 ## Status
 
-Pilot scaffold. Data-access strings in `config/pilot.yaml` are pinned to a specific MICrONS
-materialization for reproducibility — see `docs/01_DATA_ACCESS.md` before changing them.
+Days 1–2 run end-to-end against live CAVE. `config/pilot.yaml` is pinned to materialization
+**1822**, and every table name in it has been enumerated against the API rather than taken from
+documentation — see `docs/01_DATA_ACCESS.md` before changing them. 23 unit tests, no network needed.
+
+Measured cohort: **19,181 ROIs / 15,434 EM roots / 16 scans**.
+
+Not yet done: the **Day-3 gate** on the full pull, and **Days 4–5**, which need DANDI 000402
+downloaded and the NWB internal schema resolved against a real file (`data/functional.py` raises
+until then — that's the documented frontier, not a bug).
+
+One measurement fact governs how everything is normalized: **91.4% of a neuron's incoming synapses
+come from orphan axon fragments with no soma in the volume**, so they can never be assigned a cell
+type. All fractions are therefore computed over *typed* inputs, and each neuron's `frac_typed` is a
+technical covariate in M0 — otherwise "inhibitory fraction" partly measures how well that neuron's
+neighbourhood happened to reconstruct.
