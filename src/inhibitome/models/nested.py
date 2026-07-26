@@ -19,7 +19,17 @@ from inhibitome.models.validation import Fold, leave_one_scan_out, r2_oos
 # ---- Feature blocks (column names produced by the join + fingerprint steps). ----
 # Adjust the concrete column lists to what data/join.py + fingerprints emit; the STRUCTURE is fixed.
 FEATURE_BLOCKS: dict[str, list[str]] = {
-    "technical": ["depth", "imaging_quality", "em_boundary_dist"],           # M0
+    # M0 — docs/02 §2: "scan/session, cortical depth, imaging quality, EM boundary distance".
+    # These must be the names the pipeline actually emits. `imaging_quality` and `em_boundary_dist`
+    # never existed as columns, and _columns_for drops absent names without complaint, so M0 was
+    # being fit on almost nothing — which inflates every increment measured against it.
+    #   depth           cortical depth in um (data/join.py, via standard-transform)
+    #   coreg_score     EM<->2p match quality, the available proxy for imaging quality
+    #   coreg_residual  EM<->2p match residual (same)
+    #   frac_typed      share of inputs with a typable partner = reconstruction completeness
+    # session/scan_idx are deliberately NOT predictors: they are the leave-one-scan-out grouping,
+    # so a held-out scan's level is unseen at fit time and contributes nothing.
+    "technical": ["depth", "coreg_score", "coreg_residual", "frac_typed"],  # M0
     "cellular": ["area", "layer", "mtype", "dendrite_length"],               # M1 adds
     "functional": ["baseline_activity", "tuning", "response_amplitude", "reliability"],  # M2 adds
     "total_input": ["total_exc_input", "total_inh_input"],                   # M3 adds
@@ -50,11 +60,32 @@ class LadderResult:
     increments: dict[str, dict] = field(default_factory=dict)  # "M5-M2" -> {dR2, ci_lo, ci_hi, p}
 
 
-def _columns_for(model: str, df: pd.DataFrame) -> list[str]:
+def _columns_for(model: str, df: pd.DataFrame, drop: frozenset[str] = frozenset()) -> list[str]:
     cols: list[str] = []
     for block in LADDER[model]:
-        cols += [c for c in FEATURE_BLOCKS[block] if c in df.columns]
+        cols += [c for c in FEATURE_BLOCKS[block] if c in df.columns and c not in drop]
     return cols
+
+
+def _assert_blocks_present(df: pd.DataFrame, exclude_reliability: bool = False) -> None:
+    """Refuse to run the ladder when a whole feature block is missing.
+
+    `_columns_for` skips absent columns silently. That is convenient and it is how three separate
+    false negatives happened here: a block that emits nothing collapses its rung onto the rung
+    below, and the increment comes back ~0 — indistinguishable from "this factor doesn't matter".
+    An entirely empty block is never a legitimate state, so fail loudly instead.
+    """
+    empty = []
+    for block, cols in FEATURE_BLOCKS.items():
+        wanted = [c for c in cols if not (exclude_reliability and c == "reliability")]
+        if wanted and not any(c in df.columns for c in wanted):
+            empty.append(f"{block} (wanted any of {wanted})")
+    if empty:
+        raise ValueError(
+            "Feature block(s) with no columns present: " + "; ".join(empty) +
+            ". The ladder would silently collapse and report a false null. "
+            f"Available columns: {sorted(df.columns)}"
+        )
 
 
 def _make_fit_predict(cols: list[str], estimator=None, alpha: float = 1.0):
@@ -86,12 +117,14 @@ def run_ladder(
     """
     df = df.copy()
     df["__y__"] = df[y_col]
-    if exclude_reliability:
-        FEATURE_BLOCKS["functional"] = [c for c in FEATURE_BLOCKS["functional"] if c != "reliability"]
+    _assert_blocks_present(df, exclude_reliability)
+    # For the reliability endpoint the target must not also be a predictor (docs/02 §2, "M2'").
+    # Scoped per call — never mutate FEATURE_BLOCKS, or the next endpoint inherits the exclusion.
+    drop = frozenset({"reliability"}) if exclude_reliability else frozenset()
 
     res = LadderResult(endpoint=endpoint)
     for model in LADDER:
-        cols = _columns_for(model, df)
+        cols = _columns_for(model, df, drop)
         folds = list(leave_one_scan_out(df, scan_key, group_key))
         out = r2_oos(df, "__y__", _make_fit_predict(cols, estimator), iter(folds))
         res.r2[model] = out["r2_oos"]
@@ -99,14 +132,35 @@ def run_ladder(
 
     # Pre-registered increments (docs/02 §2).
     for hi, lo in [("M5", "M2"), ("M5", "M3"), ("M4", "M3"), ("M5", "M4")]:
-        res.increments[f"{hi}-{lo}"] = _bootstrap_increment(
-            df, scan_key, group_key, hi, lo, estimator, n_boot, seed
+        res.increments[f"{hi}-{lo}"] = _increment(
+            df, scan_key, group_key, hi, lo, estimator, n_boot, seed, drop
         )
     return res
 
 
-def _bootstrap_increment(df, scan_key, group_key, hi, lo, estimator, n_boot, seed) -> dict:
-    """scan-clustered bootstrap CI on dR2 = R2(hi) - R2(lo). Resamples whole scans."""
+def increment_point(df, scan_key, group_key, hi, lo, estimator=None,
+                    drop: frozenset[str] = frozenset()) -> float:
+    """Point estimate of dR2 = R2_oos(hi) - R2_oos(lo) on the data as given (no resampling).
+
+    This is the *observed statistic* — what nulls and bootstrap CIs are compared against. It must
+    be available independently of `n_boot`: permutation tests run with the bootstrap switched off.
+    """
+    def _r2_for(model: str) -> float:
+        return r2_oos(df, "__y__",
+                      _make_fit_predict(_columns_for(model, df, drop), estimator),
+                      leave_one_scan_out(df, scan_key, group_key))["r2_oos"]
+
+    return float(_r2_for(hi) - _r2_for(lo))
+
+
+def _increment(df, scan_key, group_key, hi, lo, estimator, n_boot, seed,
+               drop: frozenset[str] = frozenset()) -> dict:
+    """Observed dR2 plus a scan-clustered bootstrap CI (resamples whole scans).
+
+    `dR2` is always the point estimate on the real data; the bootstrap only supplies the interval.
+    With n_boot=0 the point estimate still comes back and the CI fields are NaN.
+    """
+    obs = increment_point(df, scan_key, group_key, hi, lo, estimator, drop)
     rng = np.random.default_rng(seed)
     scan_id = df[scan_key].astype(str).agg("|".join, axis=1)
     scans = np.array(sorted(scan_id.unique()))
@@ -117,16 +171,12 @@ def _bootstrap_increment(df, scan_key, group_key, hi, lo, estimator, n_boot, see
         b_scan = boot[scan_key].astype(str).agg("|".join, axis=1)
         if b_scan.nunique() < 2:
             continue
-        r_hi = r2_oos(boot, "__y__", _make_fit_predict(_columns_for(hi, boot), estimator),
-                      leave_one_scan_out(boot, scan_key, group_key))["r2_oos"]
-        r_lo = r2_oos(boot, "__y__", _make_fit_predict(_columns_for(lo, boot), estimator),
-                      leave_one_scan_out(boot, scan_key, group_key))["r2_oos"]
-        diffs.append(r_hi - r_lo)
+        diffs.append(increment_point(boot, scan_key, group_key, hi, lo, estimator, drop))
     diffs = np.array([d for d in diffs if np.isfinite(d)])
     if len(diffs) == 0:
-        return {"dR2": np.nan, "ci_lo": np.nan, "ci_hi": np.nan, "p_ge_0": np.nan}
+        return {"dR2": obs, "ci_lo": np.nan, "ci_hi": np.nan, "p_ge_0": np.nan}
     return {
-        "dR2": float(diffs.mean()),
+        "dR2": obs,
         "ci_lo": float(np.percentile(diffs, 2.5)),
         "ci_hi": float(np.percentile(diffs, 97.5)),
         "p_ge_0": float((diffs <= 0).mean()),  # frac of bootstrap where increment <= 0

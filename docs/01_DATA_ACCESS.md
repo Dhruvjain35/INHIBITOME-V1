@@ -49,11 +49,21 @@ client.version = 1300      # pin the materialization (config/pilot.yaml)
 ## 2. Materialization versions
 
 - List: `client.materialize.get_versions()` · timestamp: `client.materialize.get_timestamp(v)`.
-- **Live public versions (Mar 2026):** 117, 943, **1300**, 1507, 1621, 1718.
+- **Live public versions (enumerated against the API 2026-07-26):** 117, 943, 1300, 1507, 1621, 1718,
+  **1822**.
 - **Expired (static download only, not queryable):** 343, 661, 795, 1078, 1181, 1412.
-- Materializations are removed ~2 years after release, so **pin one now** and record it. We pin **1300**.
+- Materializations are removed ~2 years after release, so **pin one now** and record it. We pin
+  **1822** (2026-06-27).
+- ⚠️ **We used to pin 1300, and that was wrong.** `digital_twin_properties_bcm_coreg_v4` — the source of
+  the visual-tuning predictors in the M2 baseline — **does not exist at 1300**; it is 1822-only. The
+  original config named a table its own pinned version could not serve, so `scripts/01` would have
+  failed on the functional baseline. Corrected 2026-07-26, before the prereg freeze and before any
+  data was pulled. Measured cost of staying at 1300 would have been: tuning coverage 67% of the cohort
+  instead of 85% (10,348 vs 13,087 neurons), the older 204.3M-row compartment table instead of
+  208.6M-row `ssa_v2`, 1,865 proofread cells instead of 2,334, and no `cc_norm`. The cohort itself is
+  identical at both versions (19,181 ROIs / 15,434 roots / 16 scans).
 - ⚠️ Some table names contain `_v661` even though the v661 *materialization* is expired — the table name
-  and the materialization version are independent. Query those tables at version 1300 fine.
+  and the materialization version are independent. Those tables query fine at 1822.
 
 ## 3. Tables used (all in `config/pilot.yaml`)
 
@@ -61,29 +71,39 @@ client.version = 1300      # pin the materialization (config/pilot.yaml)
 - `synapses_pni_2` — ~337M synapses. Columns: `pre_pt_root_id`, `post_pt_root_id`, `*_pt_position`, `size`.
   Query onto a neuron: `client.materialize.synapse_query(post_ids=root_id)`. **500,000-row cap per
   query** — chunk by id batches for hub neurons.
-- `synapse_target_predictions_ssa` — ~204M spine/shaft/soma compartment predictions (2025 release). This
+- `synapse_target_predictions_ssa_v2` — **208,644,969** spine/shaft/soma compartment predictions. This
   is what turns "N inhibitory synapses" into "N inhibitory synapses *on the soma / proximal / distal /
-  apical* compartment."
+  apical* compartment." (The v1 table, 204,331,842 rows, is what 1300 had.)
 
 **Cell identity**
-- `baylor_log_reg_cell_type_coarse_v1` — excitatory vs inhibitory.
+- `baylor_log_reg_cell_type_coarse_v1` — excitatory vs inhibitory (55,063 rows).
 - `aibs_metamodel_celltypes_v661` — broadest-coverage soma/nucleus classifier (Elabbady et al. 2025).
-- `aibs_metamodel_mtypes_v661_v2` — data-driven morphological types (census).
-- `allen_column_mtypes_v1` — within-V1-column m-types.
-- `allen_v1_column_types_slanted_ref` — **expert-curated column cells (~2,204)**; the manual validation
-  set for compartment rules and inhibitory classes.
+- `aibs_metamodel_mtypes_v661_v2` — data-driven morphological types, 72,158 rows. **This is the fine
+  presynaptic label M5 depends on.** Source diversity computed over the *coarse* E/I label is
+  identically zero for every neuron, which would make the M5-vs-M4 test vacuous — see `data/join.py`.
+- `aibs_metamodel_celltypes_v661_corrections` / `aibs_metamodel_mtypes_v661_v2_corrections` —
+  corrections to the two metamodel tables above, released with 1822. Applied before fingerprinting.
+- `allen_column_mtypes_v2` — within-V1-column m-types, 1,351 rows. (There is **no** `..._v1`; the
+  original config named one.)
+- `allen_v1_column_types_slanted_ref` — expert-curated column cells, **1,357 rows** (the plan said
+  ~2,204); the manual validation set for compartment rules and inhibitory classes.
 
 **Soma / area / QC**
 - `nucleus_detection_v0` (~144K), `nucleus_ref_neuron_svm`, `nucleus_functional_area_assignment`
   (V1/AL/RL/LM), `proofreading_status_and_strategy`.
 
 **Coregistration (the bridge)**
-- `coregistration_manual_v4` — **PRIMARY cohort: 15,352 root IDs / 19,181 ROIs**, human-verified.
+- `coregistration_manual_v4` — **PRIMARY cohort: 19,181 ROIs / 15,434 unique root IDs / 16 scans**,
+  human-verified. (Measured; the plan said 15,352 roots.) Comfortably clears the Day-3 data gate of
+  ≥1,000 neurons and ≥10 scans.
 - `coregistration_auto_phase3_fwd_apl_vess_combined_v2` — automated, ~83K ROIs (secondary / expansion).
-- Linking columns: nucleus id, `pt_root_id`, `session`, `scan_idx`, `unit_id`, plus quality metrics
-  `residual` / `score`. Query: `client.materialize.query_table("coregistration_manual_v4")`.
-- `digital_twin_properties_bcm_coreg_v4` — orientation/direction tuning etc. on the manual coreg cells
-  (same schema), a convenient source of `visual tuning` baseline features.
+- Verified columns: `pt_root_id`, `session`, `scan_idx`, `unit_id`, `field`, `residual`, `score`,
+  `target_id`, `pt_position`. Query: `client.materialize.query_table("coregistration_manual_v4")`.
+- `digital_twin_properties_bcm_coreg_v4` — 15,780 rows on the manual-coreg cells, covering **13,087 of
+  the 15,434 cohort roots (84.8%)**. Verified columns: `pref_ori`, `pref_dir`, `gOSI`, `gDSI`, `OSI`,
+  `DSI`, `cc_abs`, `cc_max`, `cc_norm`, `readout_loc_x/y`. Source of the `visual tuning` baseline.
+  ⚠️ `cc_norm` is a released normalized-correlation score — use it only to **cross-check** our own
+  oracle `R_i` (§5), never as the target itself.
 
 ## 4. Functional data (DANDI 000402, NWB)
 
@@ -134,11 +154,20 @@ Only `caveclient`'s version is firmly verified; pin the rest at `uv sync` time a
 - **Cell types:** Elabbady et al., "Perisomatic ultrastructure efficiently classifies cells in mouse
   cortex," 2025 (basis for `aibs_metamodel_celltypes_v661`).
 
-## 8. Flagged / unverified (confirm at ingest, do not hard-code trust)
+## 8. Verified / still unverified
 
-- Exact token file path (`~/.cloudvolume/secrets/cave-secret.json` — very likely, confirm on first run).
-- The literal `field`/`unit_id` addressing and any dedicated `oracle_score` column.
-- Current PyPI versions of standard-transform / meshparty / nglui / cloud-volume / skeleton_plot.
+**Verified against the live API on 2026-07-26** (all 16 configured tables exist at v1822):
+- Auth works; a token *is* required for public data, and is saved to
+  `~/.cloudvolume/secrets/cave-secret.json`.
+- Cohort size, scan count, tuning coverage, and all row counts quoted in §3 above.
+- `field` and `unit_id` are real columns on `coregistration_manual_v4`.
+- There is **no** dedicated `oracle_score` column anywhere. `cc_norm` on the digital-twin table is the
+  closest released quantity. The plan to compute `R_i` ourselves from NWB stands.
+
+**Still unverified — do not hard-code trust:**
+- The DANDI 000402 NWB internal schema (which TimeSeries hold locomotion/pupil, where `unit_id` lives,
+  how the 10× repeats are marked). This is the Day-4 frontier; `data/functional.py` raises until then.
+- Current PyPI versions of meshparty / skeleton_plot / pcg-skel (not yet needed).
 - A public digital-twin *model-weights* download URL (not needed for the pilot — we use the released
   tuning-property tables, not the model itself).
 - **A specific 2026 state-dependent functional-network preprint could NOT be verified.** Search bioRxiv

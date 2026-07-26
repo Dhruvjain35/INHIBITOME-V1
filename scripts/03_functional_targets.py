@@ -52,7 +52,8 @@ def main() -> int:
         f"# Phenotype QC (Days 4-5)\n\n"
         f"- Units with phenotypes: {len(df)}\n"
         f"- Passing M_i split-half gate (>= {retest_min}): **{n_pass}**\n"
-        f"- Median reliability R_i: {df['reliability'].median():.3f}\n"
+        f"- Median reliability R_i: {df['reliability'].median():.3f}\n",
+        encoding="utf-8",
     )
     print(f"Wrote {out}; {n_pass}/{len(df)} units pass the M_i test-retest gate.")
     return 0

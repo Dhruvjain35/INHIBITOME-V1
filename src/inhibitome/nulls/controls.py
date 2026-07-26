@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from inhibitome.models.nested import FEATURE_BLOCKS, run_ladder
+from inhibitome.models.nested import FEATURE_BLOCKS, increment_point
 
 # Columns that define a matching stratum for N2 (layer/morphology-matched permutation).
 _MATCH_KEYS = ["area", "layer", "mtype"]
@@ -71,25 +71,32 @@ NULLS = {
 def run_null(
     df: pd.DataFrame, y_col: str, null_name: str, *,
     scan_key, group_key, endpoint, hi="M5", lo="M2",
-    n_perm: int = 1000, seed: int = 0, **ladder_kw,
+    n_perm: int = 1000, seed: int = 0, exclude_reliability: bool = False,
 ) -> dict:
     """Empirical p-value: fraction of `n_perm` matched shuffles whose dR2 >= the observed dR2.
 
     A small p means the real fingerprint's increment is NOT reproducible by matched chance wiring
     (good). A large p means the null does just as well (kill signal — docs/04).
+
+    Only the `hi`-vs-`lo` increment is refit per shuffle (two models), not the whole M0..M5 ladder —
+    the rest of the ladder is unaffected by a fingerprint shuffle and refitting it 1,000x is waste.
     """
     shuffle = NULLS[null_name]
-    obs = run_ladder(df, y_col, scan_key=scan_key, group_key=group_key, endpoint=endpoint,
-                     n_boot=0, **ladder_kw).increments[f"{hi}-{lo}"]["dR2"]
+    drop = frozenset({"reliability"}) if exclude_reliability else frozenset()
+
+    work = df.copy()
+    work["__y__"] = work[y_col]
+    obs = increment_point(work, scan_key, group_key, hi, lo, drop=drop)
+
     null_dr2 = []
     for k in range(n_perm):
-        sh = shuffle(df, seed=seed + k)
-        r = run_ladder(sh, y_col, scan_key=scan_key, group_key=group_key, endpoint=endpoint,
-                       n_boot=0, **ladder_kw).increments[f"{hi}-{lo}"]["dR2"]
+        sh = shuffle(work, seed=seed + k)
+        r = increment_point(sh, scan_key, group_key, hi, lo, drop=drop)
         if np.isfinite(r):
             null_dr2.append(r)
     null_dr2 = np.array(null_dr2)
-    p = float((null_dr2 >= obs).mean()) if len(null_dr2) else np.nan
+    # +1 correction: an empirical p from N shuffles can never legitimately be 0.
+    p = float((np.sum(null_dr2 >= obs) + 1) / (len(null_dr2) + 1)) if len(null_dr2) else np.nan
     return {
         "null": null_name, "observed_dR2": float(obs),
         "null_mean": float(null_dr2.mean()) if len(null_dr2) else np.nan,
