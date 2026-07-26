@@ -118,7 +118,7 @@ def _syn_table() -> pd.DataFrame:
     return pd.DataFrame({
         "post_pt_root_id": [200] * 4 + [201] * 4,
         "pre_pt_root_id": [1, 2, 3, 4, 9, 9, 9, 9],
-        "pre_ei": ["inhibitory"] * 8,
+        "pre_ei": ["inhibitory_neuron"] * 8,
         "pre_mtype": ["BC", "MC", "BPC", "NGC", "BC", "BC", "BC", "BC"],
         "compartment": ["soma", "soma", "distal_basal", "apical"] * 2,
     })
@@ -143,7 +143,7 @@ def test_raw_ssa_tag_column_is_resolved():
     syn = pd.DataFrame({
         "post_pt_root_id": [300] * 3,
         "pre_pt_root_id": [1, 2, 3],
-        "pre_ei": ["inhibitory"] * 3,
+        "pre_ei": ["inhibitory_neuron"] * 3,
         "pre_mtype": ["BC", "MC", "BPC"],
         "tag": ["soma", "shaft", "spine"],   # exactly what CAVE returns
     })
@@ -160,3 +160,57 @@ def test_coarse_only_labels_give_nan_not_a_fake_zero():
     fp = build_fingerprints(syn, pilot=True)
     assert fp["inh_source_entropy"].isna().all()
     assert fp["inh_effective_n_classes"].isna().all()
+
+
+# --- the typed denominator (config cell_typing.denominator) -------------------------------------
+
+def test_inhibitory_fraction_uses_the_typed_denominator():
+    """1 inhibitory + 1 excitatory typed input, plus 8 untypable orphan fragments.
+
+    Over typed inputs the answer is 0.5. Over all incoming it would be 0.1 -- a number that mostly
+    reports how many orphan fragments happened to land, not how inhibited the neuron is.
+    """
+    syn = pd.DataFrame({
+        "post_pt_root_id": [400] * 10,
+        "pre_pt_root_id": list(range(10)),
+        "pre_ei": ["inhibitory_neuron", "excitatory_neuron"] + [None] * 8,
+        "pre_mtype": ["BC", "23P"] + [None] * 8,
+        "tag": ["soma", "spine"] + ["spine"] * 8,
+    })
+    fp = build_fingerprints(syn, pilot=True).iloc[0]
+    assert fp["inh_fraction"] == pytest.approx(0.5)
+    assert fp["n_typed_input"] == 2
+    assert fp["inh_synapse_count"] == 1
+
+
+def test_nonneuronal_partners_are_excluded_from_the_denominator():
+    """Astrocytes and oligos are not synaptic input and must not dilute the fraction."""
+    syn = pd.DataFrame({
+        "post_pt_root_id": [401] * 4,
+        "pre_pt_root_id": [1, 2, 3, 4],
+        "pre_ei": ["inhibitory_neuron", "excitatory_neuron", "nonneuron", "nonneuron"],
+        "pre_mtype": ["BC", "23P", "astrocyte", "oligo"],
+        "tag": ["soma", "spine", "shaft", "shaft"],
+    })
+    fp = build_fingerprints(syn, pilot=True).iloc[0]
+    assert fp["n_typed_input"] == 2, "non-neuronal partners leaked into the denominator"
+    assert fp["inh_fraction"] == pytest.approx(0.5)
+
+
+def test_itc_label_is_not_mistaken_for_inhibitory_by_prefix():
+    """'ITC' (interneuron-targeting class) starts with 'i' but is an m-type, not an E/I call."""
+    syn = pd.DataFrame({
+        "post_pt_root_id": [402] * 2,
+        "pre_pt_root_id": [1, 2],
+        "pre_ei": ["excitatory_neuron", "excitatory_neuron"],
+        "pre_mtype": ["ITC", "23P"],
+        "tag": ["spine", "spine"],
+    })
+    fp = build_fingerprints(syn, pilot=True).iloc[0]
+    assert fp["inh_synapse_count"] == 0
+    assert fp["inh_fraction"] == pytest.approx(0.0)
+
+
+def test_frac_typed_is_in_the_m0_technical_block():
+    """Reconstruction completeness must be controlled for before any fingerprint credit."""
+    assert "frac_typed" in FEATURE_BLOCKS["technical"]

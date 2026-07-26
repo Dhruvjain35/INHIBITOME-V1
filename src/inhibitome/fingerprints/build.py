@@ -63,8 +63,15 @@ def _map_compartment(raw: pd.Series) -> pd.Series:
 
 
 def _is_inhibitory(pre_ei: pd.Series) -> pd.Series:
+    """True for inhibitory presynaptic partners.
+
+    aibs_metamodel_celltypes_v661.classification_system emits 'inhibitory_neuron' /
+    'excitatory_neuron' / 'nonneuron', so a plain 'inhibitory' prefix suffices. The old bare 'i'
+    prefix was a hazard waiting to fire: any future label starting with i — 'ITC', the
+    interneuron-targeting class — would have been swept in as inhibitory.
+    """
     s = pre_ei.astype(str).str.lower()
-    return s.str.startswith(("inh", "i")) | s.isin({"inhibitory", "gaba"})
+    return s.str.startswith("inhibitory") | s.isin({"inh", "gaba"})
 
 
 def build_fingerprints(
@@ -95,23 +102,35 @@ def build_fingerprints(
         src_col = None
 
     df["is_inh"] = _is_inhibitory(df[pre_col])
+    # "Typed neuronal input". Note astype("string") not astype(str): the latter renders NaN as the
+    # literal "none", which passes a not-nonneuron test and would quietly count every untypable
+    # orphan fragment as a neuron — restoring the all-incoming denominator we just removed.
+    _lab = df[pre_col].astype("string").str.lower()
+    df["is_neuron"] = _lab.notna() & ~_lab.str.startswith("nonneuron").fillna(False)
     df["compartment"] = (
         _map_compartment(df[comp_col]) if comp_col else "unknown"
     )
 
     rows = []
     for root_id, g in df.groupby("post_pt_root_id"):
-        inh = g[g["is_inh"]]
-        n_total = len(g)
+        # Denominator = TYPED NEURONAL inputs. Not all incoming: 91.4% of a neuron's synapses come
+        # from untypable orphan fragments, so n_inh/all_incoming (median 0.049) largely measures
+        # local reconstruction density. Over typed inputs the median is 0.588 — the biologically
+        # meaningful quantity. Reconstruction completeness is carried separately as `frac_typed`
+        # in the M0 technical block, so the ladder controls for it explicitly.
+        # Non-neuronal partners (astrocyte/oligo/microglia) are excluded from the denominator
+        # rather than counted as input.
+        typed = g[g["is_neuron"]]
+        inh = typed[typed["is_inh"]]
+        n_typed = len(typed)
         n_inh = len(inh)
         feat: dict[str, float] = {
             "pt_root_id": int(root_id),
             # --- amount ---
             "inh_synapse_count": n_inh,
-            "inh_fraction": n_inh / n_total if n_total else np.nan,
-            "n_inh_source_neurons": inh[
-                inh.columns[inh.columns.str.contains("pre_pt_root_id")][0]
-            ].nunique() if n_inh else 0,
+            "n_typed_input": n_typed,
+            "inh_fraction": n_inh / n_typed if n_typed else np.nan,
+            "n_inh_source_neurons": inh["pre_pt_root_id"].nunique() if n_inh else 0,
         }
         if dendrite_length is not None and root_id in dendrite_length.index:
             L = float(dendrite_length.loc[root_id])

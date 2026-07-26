@@ -63,52 +63,99 @@ class Cave:
                     use_cache: bool = True, **kwargs) -> pd.DataFrame:
         """Query an annotation table by config key (preferred) or raw name.
 
-        `filter_in={'pt_root_id': [...]}` maps to CAVE's `filter_in_dict`.
+        `filter_in={'pt_root_id': [...]}` is applied CLIENT-SIDE by default. The cell-type and
+        coregistration tables are *reference* tables: `pt_root_id` belongs to the referenced
+        nucleus table, not the annotation model, so a server-side filter on it 500s with
+        `KeyError: 'pt_root_id'`. Every table we read this way is under 150k rows, so fetching the
+        whole thing once and filtering in pandas is both correct and better cached — one copy per
+        table, reused by every caller, instead of one cache entry per id list.
+
+        Columns that DO live on the annotation model (e.g. `target_id`) can still be pushed to the
+        server with `server_filter_in=`.
         """
         name = CFG.tables.get(table_key_or_name, table_key_or_name)
-        cache = _cache_key("table", name=name, filter_in=filter_in, kwargs=kwargs)
-        if use_cache and cache.exists():
-            return pd.read_parquet(cache)
+        server_filter = kwargs.pop("server_filter_in", None)
+        cache = _cache_key("table", name=name, server_filter=server_filter, kwargs=kwargs)
 
-        df = self.client.materialize.query_table(
-            name,
-            filter_in_dict=filter_in,
-            materialization_version=self.version,
-            **kwargs,
-        )
-        df.to_parquet(cache)
+        if use_cache and cache.exists():
+            df = pd.read_parquet(cache)
+        else:
+            df = self.client.materialize.query_table(
+                name,
+                filter_in_dict=server_filter,
+                materialization_version=self.version,
+                **kwargs,
+            )
+            df.to_parquet(cache)
+
+        if filter_in:
+            for col, values in filter_in.items():
+                if col not in df.columns:
+                    raise KeyError(f"'{col}' not in {name}; have {list(df.columns)}")
+                df = df[df[col].isin(set(values))]
+            df = df.reset_index(drop=True)
         return df
 
-    def synapses_onto(self, root_ids: Iterable[int], *, use_cache: bool = True,
-                      batch_size: int = _SYNAPSE_BATCH, progress: bool = True) -> pd.DataFrame:
-        """Incoming synapses for post-synaptic `root_ids`, chunked under the 500k cap.
+    def synapses_onto(self, root_ids: Iterable[int], *, keep_pre_ids: Iterable[int] | None = None,
+                      use_cache: bool = True, batch_size: int = _SYNAPSE_BATCH,
+                      progress: bool = True) -> tuple[pd.DataFrame, pd.Series]:
+        """Incoming synapses for `root_ids`, plus each neuron's TOTAL in-degree.
 
-        Returns synapses_pni_2 rows: pre_pt_root_id, post_pt_root_id, positions, size.
+        Returns `(synapses, degree)`:
+          synapses — synapses_pni_2 rows, filtered to `keep_pre_ids` if given;
+          degree   — total incoming count per root id, counting *every* partner.
+
+        Why one pass and not two: 91.4% of incoming synapses come from orphan axon fragments with
+        no soma, which no table can type and which therefore carry no source or compartment
+        identity. We do not want them in the stored table (~47M rows vs ~4M), but we do need them
+        in the *denominator* — otherwise `inh_fraction` silently encodes local reconstruction
+        density instead of inhibition. So each batch is fetched once, counted in full, and only
+        the typed rows are kept. The transfer is unavoidable; the storage and every downstream
+        groupby shrink ~10x.
+
+        There is no cheaper exact route: `synapse_query` has no `count` parameter, and the
+        `synapses_pni_2_in_out_degree` view rejects `pt_root_id` as a filter (500) while an
+        unfiltered read scans 337M rows.
 
         Cohort neurons carry ~3,000 incoming synapses each (measured: median 2,294, max ~6,000), so
-        the cap binds at ~160 post_ids. We batch well under that and, on the rare batch that still
-        caps out, bisect rather than dropping to one-id-at-a-time — a 15k-neuron cohort would
-        otherwise become 15k round trips.
+        the 500k cap binds at ~160 post_ids. We batch under that and bisect a batch that still caps
+        out, rather than dropping to one-id-at-a-time — a 15k cohort would become 15k round trips.
 
-        Each batch is cached separately, so a multi-hour pull resumes where it stopped instead of
-        restarting from zero.
+        Each batch is cached separately, so a long pull resumes where it stopped.
         """
-        root_ids = list(dict.fromkeys(int(r) for r in root_ids))  # de-dup, keep order
+        root_ids = list(dict.fromkeys(int(r) for r in root_ids))
+        keep = set(int(p) for p in keep_pre_ids) if keep_pre_ids is not None else None
+
         frames: list[pd.DataFrame] = []
+        degrees: list[pd.Series] = []
         batches = list(_batched(root_ids, batch_size))
         for i, batch in enumerate(batches):
-            cache = _cache_key("syn_onto_batch", ids=batch)
-            if use_cache and cache.exists():
-                frames.append(pd.read_parquet(cache))
+            syn_cache = _cache_key("syn_typed_batch", ids=batch, filtered=keep is not None)
+            deg_cache = _cache_key("syn_degree_batch", ids=batch)
+            if use_cache and syn_cache.exists() and deg_cache.exists():
+                frames.append(pd.read_parquet(syn_cache))
+                d = pd.read_parquet(deg_cache)
+                degrees.append(d.set_index(d.columns[0])[d.columns[1]])
                 continue
-            df = self._synapse_query_bisect(batch)
-            df.to_parquet(cache)
-            frames.append(df)
+
+            raw = self._synapse_query_bisect(batch)
+            deg = raw.groupby("post_pt_root_id").size()
+            kept = raw[raw["pre_pt_root_id"].isin(keep)] if keep is not None else raw
+
+            kept.to_parquet(syn_cache)
+            deg.rename("n_total_input").reset_index().to_parquet(deg_cache)
+            frames.append(kept)
+            degrees.append(deg)
             if progress:
-                done = sum(len(f) for f in frames)
-                print(f"  synapses: batch {i + 1}/{len(batches)}  (+{len(df):,} -> {done:,} total)",
+                n_all, n_keep = len(raw), len(kept)
+                print(f"  synapses: batch {i + 1}/{len(batches)}  "
+                      f"{n_all:,} seen -> {n_keep:,} typed ({n_keep / max(n_all, 1):.1%})",
                       flush=True)
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+        syn = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        degree = (pd.concat(degrees).groupby(level=0).sum() if degrees
+                  else pd.Series(dtype="int64"))
+        return syn, degree
 
     def _synapse_query_bisect(self, ids: list[int]) -> pd.DataFrame:
         """Query these post_ids; a result at the row cap is truncated, so split and retry."""
@@ -139,6 +186,7 @@ class Cave:
             if use_cache and cache.exists():
                 frames.append(pd.read_parquet(cache))
                 continue
+            # target_id IS on the annotation model, so this one filters server-side.
             df = self.client.materialize.query_table(
                 name, filter_in_dict={"target_id": part},
                 materialization_version=self.version,

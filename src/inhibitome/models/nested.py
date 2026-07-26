@@ -19,7 +19,11 @@ from inhibitome.models.validation import Fold, leave_one_scan_out, r2_oos
 # ---- Feature blocks (column names produced by the join + fingerprint steps). ----
 # Adjust the concrete column lists to what data/join.py + fingerprints emit; the STRUCTURE is fixed.
 FEATURE_BLOCKS: dict[str, list[str]] = {
-    "technical": ["depth", "imaging_quality", "em_boundary_dist"],           # M0
+    # frac_typed = share of a neuron's incoming synapses with a typable presynaptic partner, i.e.
+    # how completely its neighbourhood reconstructed. It belongs here, in the technical block, so
+    # every later increment is measured beyond reconstruction quality rather than partly encoding
+    # it (see fingerprints/build.py on the denominator).
+    "technical": ["depth", "imaging_quality", "em_boundary_dist", "frac_typed"],  # M0
     "cellular": ["area", "layer", "mtype", "dendrite_length"],               # M1 adds
     "functional": ["baseline_activity", "tuning", "response_amplitude", "reliability"],  # M2 adds
     "total_input": ["total_exc_input", "total_inh_input"],                   # M3 adds

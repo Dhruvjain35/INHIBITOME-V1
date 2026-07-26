@@ -58,6 +58,15 @@ class Config:
     def compartments(self) -> list[str]:
         return list(self.raw["compartments"])
 
+    @property
+    def typing(self) -> dict[str, Any]:
+        """Cell-typing choices + the normalization that follows from them (see pilot.yaml)."""
+        return self.raw["cell_typing"]
+
+    @property
+    def use_typed_denominator(self) -> bool:
+        return self.typing.get("denominator", "typed") == "typed"
+
     def path(self, key: str) -> Path:
         """Resolve a configured path relative to the repo root and ensure it exists."""
         p = REPO_ROOT / self.raw["paths"][key]

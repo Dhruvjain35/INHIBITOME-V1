@@ -25,31 +25,56 @@ def build_master(cave: Cave | None = None, *, cohort: str = "coreg_manual") -> d
     """
     cave = cave or Cave()
     proc = CFG.path("processed")
+    typing = CFG.typing
 
     # 1) Cohort: human-verified EM<->functional matches (the bridge to DANDI function).
     coreg = cave.query_table(cohort)
-    # Expected columns include: pt_root_id, session, scan_idx, unit_id, residual, score.
+    # Verified columns: pt_root_id, session, scan_idx, unit_id, field, residual, score.
     root_ids = coreg["pt_root_id"].dropna().astype("int64").unique().tolist()
+    print(f"cohort: {len(coreg):,} ROIs / {len(root_ids):,} roots")
 
     # 2) Cell identity — keep excitatory post-synaptic neurons only.
-    ei = cave.query_table("ei_coarse", filter_in={"pt_root_id": root_ids})
+    ei = cave.query_table(typing["primary"], filter_in={"pt_root_id": root_ids})
     mtypes = cave.query_table("mtypes", filter_in={"pt_root_id": root_ids})
     exc_ids = _excitatory_root_ids(ei)
+    print(f"excitatory cohort neurons: {len(exc_ids):,}")
 
     # 3) Area assignment + soma position (depth via standard-transform downstream).
     area = cave.query_table("functional_area", filter_in={"pt_root_id": exc_ids})
     proof = cave.query_table("proofreading", filter_in={"pt_root_id": exc_ids})
 
-    # 4) Incoming synapses onto the excitatory cohort, with pre-synaptic E/I + compartment.
-    syn = cave.synapses_onto(exc_ids)
+    # 4) Incoming synapses. 91.4% of them come from orphan axon fragments with no soma, which no
+    #    table can ever type — pulling those costs ~10x the rows and yields no source or
+    #    compartment identity. We restrict the pull to typed presynaptic partners and recover the
+    #    true total degree separately (step 5), so the untyped mass is still *counted*, just not
+    #    materialized row by row.
+    typed_pre = _typed_presynaptic_ids(cave) if typing["restrict_pull_to_typed"] else None
+    if typed_pre is not None:
+        print(f"typed presynaptic universe: {len(typed_pre):,} cells")
+    syn, degree = cave.synapses_onto(exc_ids, keep_pre_ids=typed_pre)
     syn = _annotate_synapses(cave, syn)
 
-    # 5) One row per EM neuron (functional ROIs stay in coreg; a neuron may map to several).
+    # 5) Reconstruction completeness per neuron. `frac_typed` goes into the M0 technical block so
+    #    every fingerprint increment is measured *beyond* how well the neighbourhood reconstructed.
+    typed_counts = syn.groupby("post_pt_root_id").size().rename("n_typed_input")
+    completeness = (
+        pd.concat([degree.rename("n_total_input"), typed_counts], axis=1)
+        .fillna(0).astype("int64")
+        .rename_axis("pt_root_id").reset_index()
+    )
+    completeness["frac_typed"] = (
+        completeness["n_typed_input"] / completeness["n_total_input"].replace(0, pd.NA)
+    ).astype(float)
+    print(f"synapses kept: {len(syn):,} typed of {int(degree.sum()):,} total "
+          f"(median frac_typed {completeness['frac_typed'].median():.1%})")
+
+    # 6) One row per EM neuron (functional ROIs stay in coreg; a neuron may map to several).
     master = (
         coreg[coreg["pt_root_id"].isin(exc_ids)]
         .merge(_reduce(mtypes, "pt_root_id"), on="pt_root_id", how="left")
         .merge(_reduce(area, "pt_root_id"), on="pt_root_id", how="left")
         .merge(_reduce(proof, "pt_root_id"), on="pt_root_id", how="left")
+        .merge(completeness, on="pt_root_id", how="left")
     )
 
     master_path = proc / "master_neurons.parquet"
@@ -59,39 +84,58 @@ def build_master(cave: Cave | None = None, *, cohort: str = "coreg_manual") -> d
     return {"master": master_path, "synapses": syn_path}
 
 
+def _typed_presynaptic_ids(cave: Cave) -> list[int]:
+    """Every root id the primary cell-type table can label — the pull's presynaptic universe."""
+    t = cave.query_table(CFG.typing["primary"])
+    return t["pt_root_id"].dropna().astype("int64").unique().tolist()
+
+
 def _excitatory_root_ids(ei: pd.DataFrame) -> list[int]:
-    """Root ids classified excitatory. Column literal ('classification_system'/'cell_type') varies
-    by table version — resolve defensively and record what we used."""
-    col = _first_present(ei, ["cell_type", "classification_system", "pred_cell_type", "class"])
-    if col is None:
-        raise ValueError(f"Could not find an E/I class column in {list(ei.columns)}")
-    exc_mask = ei[col].astype(str).str.lower().str.startswith(("exc", "e", "pyr", "23p", "4p",
-                                                              "5p", "6p"))
-    return ei.loc[exc_mask, "pt_root_id"].astype("int64").unique().tolist()
+    """Root ids classified excitatory by the primary cell-type table.
+
+    Verified schema of aibs_metamodel_celltypes_v661: `classification_system` holds
+    excitatory_neuron / inhibitory_neuron / nonneuron, and `cell_type` holds the fine label
+    (23P, 4P, 5P-IT, BC, MC, NGC, BPC, astrocyte, oligo, microglia). Read the coarse column
+    directly — the old prefix heuristic over `cell_type` would have swept in 'astrocyte' via its
+    leading 'a'... and, worse, matched almost anything against the bare 'e' prefix.
+    """
+    col = CFG.typing["ei_column"]
+    if col not in ei.columns:
+        raise ValueError(f"Expected '{col}' in the cell-type table; got {list(ei.columns)}")
+    exc = ei[col].astype(str).str.lower().str.startswith("excitatory")
+    return ei.loc[exc, "pt_root_id"].astype("int64").unique().tolist()
 
 
 def _annotate_synapses(cave: Cave, syn: pd.DataFrame) -> pd.DataFrame:
     """Attach pre-synaptic class labels and the post-synaptic compartment prediction per synapse.
 
-    TWO presynaptic labels, kept separate on purpose (docs/00 Aim 2: "broad *and* fine labels kept
-    separate"):
-      pre_ei    — coarse excitatory/inhibitory, used to decide which synapses are inhibitory at all;
-      pre_mtype — fine morphological type, used for SOURCE composition and diversity (M5).
-    The fine label is not optional: source entropy computed over `pre_ei` within the inhibitory
-    synapses is identically zero for every neuron, which would make M5 untestable by construction.
+    THREE presynaptic labels, kept separate on purpose (docs/00 Aim 2: "broad *and* fine labels
+    kept separate"):
+      pre_ei    — excitatory_neuron / inhibitory_neuron / nonneuron; decides what counts as
+                  inhibitory, and lets non-neuronal partners (astrocyte, oligo, microglia) be
+                  excluded rather than silently counted as input;
+      pre_type  — fine cell type from the same table (BC, MC, NGC, BPC, 23P, 4P, ...);
+      pre_mtype — m-type from the census table, whose inhibitory labels are *targeting* classes
+                  (PTC perisomatic-targeting, DTC dendrite-targeting) — the vocabulary docs/00
+                  Aim 2 is actually written in.
+    The fine labels are not optional: source entropy over the coarse E/I label, within the
+    inhibitory synapses, is identically zero for every neuron — M5 would be untestable.
     """
     if syn.empty:
         return syn
     pre_ids = syn["pre_pt_root_id"].dropna().astype("int64").unique().tolist()
-    pre_ei = cave.query_table("ei_coarse", filter_in={"pt_root_id": pre_ids})
-    col = _first_present(pre_ei, ["cell_type", "classification_system", "pred_cell_type", "class"])
-    pre_ei = pre_ei.rename(columns={"pt_root_id": "pre_pt_root_id", col: "pre_ei"})[
-        ["pre_pt_root_id", "pre_ei"]
-    ]
+    typing = CFG.typing
+
+    pre_ei = cave.query_table(typing["primary"], filter_in={"pt_root_id": pre_ids})
+    pre_ei = _reduce(pre_ei, "pt_root_id")[
+        ["pt_root_id", typing["ei_column"], typing["type_column"]]
+    ].rename(columns={"pt_root_id": "pre_pt_root_id",
+                      typing["ei_column"]: "pre_ei",
+                      typing["type_column"]: "pre_type"})
     syn = syn.merge(pre_ei, on="pre_pt_root_id", how="left")
 
-    # Fine presynaptic m-type (the interneuron classes M5 is actually about).
-    pre_mt = cave.query_table("mtypes", filter_in={"pt_root_id": pre_ids})
+    # Fine presynaptic m-type (the targeting classes M5 source diversity is computed over).
+    pre_mt = cave.query_table(typing["source_label"], filter_in={"pt_root_id": pre_ids})
     mt_col = _first_present(pre_mt, ["cell_type", "pred_cell_type", "mtype", "class"])
     if mt_col is not None:
         pre_mt = pre_mt.rename(columns={"pt_root_id": "pre_pt_root_id", mt_col: "pre_mtype"})[

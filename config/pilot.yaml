@@ -34,9 +34,13 @@ data:
     synapse_compartment: synapse_target_predictions_ssa_v2  # 208.6M spine/shaft/soma preds
 
     # --- cell identity ---
-    ei_coarse: baylor_log_reg_cell_type_coarse_v1  # excitatory vs inhibitory
-    ei_meta: aibs_metamodel_celltypes_v661         # broad-coverage soma/nucleus classifier
-    mtypes: aibs_metamodel_mtypes_v661_v2          # data-driven morphological types
+    # ei_meta is the PRIMARY E/I source (see cell_typing.primary below). Measured coverage of the
+    # synapses actually landing on cohort neurons: ei_meta 8.4%, mtypes 7.7%, ei_coarse 4.0%.
+    # The structural ceiling is 8.6% (fraction of synapses whose partner has a neuron nucleus at
+    # all), so ei_meta is effectively at ceiling and ei_coarse leaves half the signal on the floor.
+    ei_meta: aibs_metamodel_celltypes_v661         # 94,014 rows; classification_system + cell_type
+    ei_coarse: baylor_log_reg_cell_type_coarse_v1  # 55,063 rows; kept for cross-checking only
+    mtypes: aibs_metamodel_mtypes_v661_v2          # data-driven m-types; PTC/DTC targeting classes
     mtypes_column: allen_column_mtypes_v2          # within-V1-column m-types (v1 does not exist)
     manual_column: allen_v1_column_types_slanted_ref  # expert-curated column cells (validation)
 
@@ -67,12 +71,34 @@ data:
     dandiset: "000402"                 # MICrONS two-photon functional imaging (NWB)
     local_dir: data/raw/dandi_000402
 
+# --- Cell typing + the normalization that follows from it -------------------
+# MEASURED 2026-07-26 on 100 cohort neurons / 318,161 incoming synapses:
+#   91.4% of incoming synapses come from orphan axon fragments with NO soma in the volume
+#   (244,857 distinct partners for 318,161 synapses — ~1.3 synapses each). Untypable, forever.
+# Consequence: n_inh / ALL_incoming has median 0.049 and largely encodes how many untypable
+# fragments happen to touch a neuron — i.e. local reconstruction density, a technical artifact.
+# n_inh / TYPED_incoming has median 0.588 and is the biologically meaningful quantity.
+# We therefore normalize over TYPED inputs and carry `frac_typed` as an M0 technical covariate,
+# so every fingerprint increment is measured beyond reconstruction completeness.
+cell_typing:
+  primary: ei_meta                     # which table defines excitatory / inhibitory
+  ei_column: classification_system     # values: excitatory_neuron / inhibitory_neuron / nonneuron
+  type_column: cell_type               # values: 23P 4P 5P-IT ... BC MC NGC BPC astrocyte oligo
+  source_label: mtypes                 # fine presynaptic identity for M5 source diversity
+  denominator: typed                   # 'typed' | 'all' — normalization base for all fractions
+  restrict_pull_to_typed: true         # only pull synapses whose presynaptic partner is typed
+
 # --- Data gate (Day 3): proceed only if ALL pass (docs/03, docs/02 §6) ---
 gates:
   min_coreg_neurons: 1000
   min_scans: 10
   min_neurons_with_fingerprint: 300    # "hundreds"
   min_compartment_labeled_fraction: 0.5   # per-neuron usable compartment labels
+  # Fraction of a neuron's incoming synapses with a typed presynaptic partner. The ceiling is
+  # ~8.6% volume-wide, so this gates on the TYPED-INPUT COUNT instead, which is what actually
+  # limits a fingerprint. Measured: median 129 typed inhibitory inputs/neuron, min 26, 90/100
+  # neurons above 50. A neuron below the floor gets no fingerprint rather than a noisy one.
+  min_typed_inhibitory_per_neuron: 20
   retest_reliability_min: 0.30         # split-half Corr for M_i to be retained
 
 # --- Validation (docs/02 §4) ---
