@@ -15,7 +15,7 @@ def main() -> int:
     synapses = pd.read_parquet(proc / "incoming_synapses.parquet")
 
     result = sample_accounting(master, synapses)
-    print(open(result["report"]).read())
+    print(open(result["report"], encoding="utf-8").read())
 
     if not result["passed"]:
         print("\n❌ DATA GATE FAILED — see docs/04_KILL_AND_SUCCESS.md before continuing.")

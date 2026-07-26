@@ -19,11 +19,17 @@ from inhibitome.models.validation import Fold, leave_one_scan_out, r2_oos
 # ---- Feature blocks (column names produced by the join + fingerprint steps). ----
 # Adjust the concrete column lists to what data/join.py + fingerprints emit; the STRUCTURE is fixed.
 FEATURE_BLOCKS: dict[str, list[str]] = {
-    # frac_typed = share of a neuron's incoming synapses with a typable presynaptic partner, i.e.
-    # how completely its neighbourhood reconstructed. It belongs here, in the technical block, so
-    # every later increment is measured beyond reconstruction quality rather than partly encoding
-    # it (see fingerprints/build.py on the denominator).
-    "technical": ["depth", "imaging_quality", "em_boundary_dist", "frac_typed"],  # M0
+    # M0 — docs/02 §2: "scan/session, cortical depth, imaging quality, EM boundary distance".
+    # These must be the names the pipeline actually emits. `imaging_quality` and `em_boundary_dist`
+    # never existed as columns, and _columns_for drops absent names without complaint, so M0 was
+    # being fit on almost nothing — which inflates every increment measured against it.
+    #   depth           cortical depth in um (data/join.py, via standard-transform)
+    #   coreg_score     EM<->2p match quality, the available proxy for imaging quality
+    #   coreg_residual  EM<->2p match residual (same)
+    #   frac_typed      share of inputs with a typable partner = reconstruction completeness
+    # session/scan_idx are deliberately NOT predictors: they are the leave-one-scan-out grouping,
+    # so a held-out scan's level is unseen at fit time and contributes nothing.
+    "technical": ["depth", "coreg_score", "coreg_residual", "frac_typed"],  # M0
     "cellular": ["area", "layer", "mtype", "dendrite_length"],               # M1 adds
     "functional": ["baseline_activity", "tuning", "response_amplitude", "reliability"],  # M2 adds
     "total_input": ["total_exc_input", "total_inh_input"],                   # M3 adds
@@ -61,6 +67,27 @@ def _columns_for(model: str, df: pd.DataFrame, drop: frozenset[str] = frozenset(
     return cols
 
 
+def _assert_blocks_present(df: pd.DataFrame, exclude_reliability: bool = False) -> None:
+    """Refuse to run the ladder when a whole feature block is missing.
+
+    `_columns_for` skips absent columns silently. That is convenient and it is how three separate
+    false negatives happened here: a block that emits nothing collapses its rung onto the rung
+    below, and the increment comes back ~0 — indistinguishable from "this factor doesn't matter".
+    An entirely empty block is never a legitimate state, so fail loudly instead.
+    """
+    empty = []
+    for block, cols in FEATURE_BLOCKS.items():
+        wanted = [c for c in cols if not (exclude_reliability and c == "reliability")]
+        if wanted and not any(c in df.columns for c in wanted):
+            empty.append(f"{block} (wanted any of {wanted})")
+    if empty:
+        raise ValueError(
+            "Feature block(s) with no columns present: " + "; ".join(empty) +
+            ". The ladder would silently collapse and report a false null. "
+            f"Available columns: {sorted(df.columns)}"
+        )
+
+
 def _make_fit_predict(cols: list[str], estimator=None, alpha: float = 1.0):
     def fit_predict(train: pd.DataFrame, test: pd.DataFrame) -> np.ndarray:
         Xtr = pd.get_dummies(train[cols], drop_first=True)
@@ -90,6 +117,7 @@ def run_ladder(
     """
     df = df.copy()
     df["__y__"] = df[y_col]
+    _assert_blocks_present(df, exclude_reliability)
     # For the reliability endpoint the target must not also be a predictor (docs/02 §2, "M2'").
     # Scoped per call — never mutate FEATURE_BLOCKS, or the next endpoint inherits the exclusion.
     drop = frozenset({"reliability"}) if exclude_reliability else frozenset()

@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 
 from inhibitome.config import CFG
+from inhibitome.fingerprints.build import _col, _COMPARTMENT_COL
 
 
 def sample_accounting(master: pd.DataFrame, synapses: pd.DataFrame,
@@ -32,7 +33,12 @@ def sample_accounting(master: pd.DataFrame, synapses: pd.DataFrame,
     min_inh = g["min_typed_inhibitory_per_neuron"]
     n_with_fingerprint = int((inh_per_neuron >= min_inh).sum())
 
-    comp_labeled = _labeled_fraction(synapses, "compartment")
+    # Resolve the compartment column with the SAME resolver the fingerprints use. The join stores
+    # the raw CAVE column (`tag`); only build_fingerprints renames it to `compartment`. Hard-coding
+    # "compartment" here made the gate report 0.0% coverage against a real 98.8%, and fail the
+    # pilot on a column-name mismatch.
+    comp_col = _col(synapses, _COMPARTMENT_COL)
+    comp_labeled = _labeled_fraction(synapses, comp_col) if comp_col else 0.0
     class_labeled = _labeled_fraction(synapses, "pre_ei")
     frac_typed = (float(master["frac_typed"].median())
                   if "frac_typed" in master.columns else float("nan"))
@@ -52,15 +58,24 @@ def sample_accounting(master: pd.DataFrame, synapses: pd.DataFrame,
     md = _render(n_neurons, n_scans, neurons_per_scan, inh_per_neuron, comp_labeled,
                 class_labeled, checks, passed, frac_typed, min_inh)
     out_path = out_path or (CFG.path("outputs") / "sample_accounting.md")
-    out_path.write_text(md)
+    out_path.write_text(md, encoding="utf-8")
     return {"passed": passed, "checks": checks, "report": str(out_path)}
 
 
 def _labeled_fraction(df: pd.DataFrame, col: str) -> float:
+    """Share of rows carrying a usable label.
+
+    Check `isna()` BEFORE stringifying: `astype(str)` renders pandas NA as the literal "<NA>",
+    which is not in the sentinel list, so missing labels were counted as present — reporting
+    100.0% coverage against a true 98.8%, on a value the data gate is thresholded against.
+    """
     if col not in df.columns or len(df) == 0:
         return 0.0
-    s = df[col].astype(str).str.lower()
-    return float((~s.isin(["", "nan", "none", "unknown"])).mean())
+    s = df[col]
+    usable = ~s.isna() & ~s.astype(str).str.strip().str.lower().isin(
+        ["", "nan", "none", "<na>", "unknown", "nonneuron"]
+    )
+    return float(usable.mean())
 
 
 def _render(n_neurons, n_scans, per_scan, inh_per_neuron, comp, cls, checks, passed,

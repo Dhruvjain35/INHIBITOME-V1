@@ -29,7 +29,8 @@ def main() -> int:
         f"- Neurons with a fingerprint: {len(fp)}\n"
         f"- Median inhibitory synapses/neuron: {fp['inh_synapse_count'].median():.0f}\n"
         f"- Median perisomatic fraction: {fp['inh_frac_perisomatic'].median():.3f}\n"
-        f"- Median dendritic fraction: {fp['inh_frac_dendritic'].median():.3f}\n"
+        f"- Median dendritic fraction: {fp['inh_frac_dendritic'].median():.3f}\n",
+        encoding="utf-8",
     )
     print(f"Wrote {out} ({len(fp)} neurons).")
     return 0

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from inhibitome.config import CFG
@@ -68,14 +69,27 @@ def build_master(cave: Cave | None = None, *, cohort: str = "coreg_manual") -> d
     print(f"synapses kept: {len(syn):,} typed of {int(degree.sum()):,} total "
           f"(median frac_typed {completeness['frac_typed'].median():.1%})")
 
-    # 6) One row per EM neuron (functional ROIs stay in coreg; a neuron may map to several).
+    # 6) One row per functional ROI (a neuron may map to several; coreg keeps them distinct).
+    #    Every annotation table carries the same generic columns (id, created, valid, pt_position,
+    #    pt_supervoxel_id), so merging them whole collides on the second merge:
+    #    MergeError: 'suffixes' which cause duplicate columns {'id_x', ...}. Select what each table
+    #    is actually for, and give it a name that says so.
     master = (
-        coreg[coreg["pt_root_id"].isin(exc_ids)]
-        .merge(_reduce(mtypes, "pt_root_id"), on="pt_root_id", how="left")
-        .merge(_reduce(area, "pt_root_id"), on="pt_root_id", how="left")
-        .merge(_reduce(proof, "pt_root_id"), on="pt_root_id", how="left")
+        coreg.loc[coreg["pt_root_id"].isin(exc_ids),
+                  ["pt_root_id", "session", "scan_idx", "unit_id", "field",
+                   "residual", "score", "pt_position"]]
+        .rename(columns={"residual": "coreg_residual", "score": "coreg_score"})
+        .merge(_pick(mtypes, {"cell_type": "mtype"}), on="pt_root_id", how="left")
+        .merge(_pick(area, {"tag": "area"}), on="pt_root_id", how="left")
+        .merge(_pick(proof, {"status_dendrite": "proof_dendrite",
+                             "status_axon": "proof_axon",
+                             "strategy_dendrite": "proof_strategy_dendrite"}),
+               on="pt_root_id", how="left")
         .merge(completeness, on="pt_root_id", how="left")
     )
+    master = _add_depth(master)
+    print(f"master: {len(master):,} ROI rows / {master['pt_root_id'].nunique():,} neurons; "
+          f"areas {master['area'].value_counts().to_dict()}")
 
     master_path = proc / "master_neurons.parquet"
     syn_path = proc / "incoming_synapses.parquet"
@@ -155,6 +169,53 @@ def _annotate_synapses(cave: Cave, syn: pd.DataFrame) -> pd.DataFrame:
             comp = comp[keep].rename(columns={id_col: syn_id})
             syn = syn.merge(_reduce(comp, syn_id), on=syn_id, how="left")
     return syn
+
+
+def _pick(df: pd.DataFrame, cols: dict[str, str]) -> pd.DataFrame:
+    """One row per pt_root_id, keeping only `cols` (mapped old->new). Avoids merge collisions."""
+    present = {old: new for old, new in cols.items() if old in df.columns}
+    missing = set(cols) - set(present)
+    if missing:
+        raise KeyError(f"expected {sorted(missing)} in table; have {list(df.columns)}")
+    return (_reduce(df, "pt_root_id")[["pt_root_id", *present]]
+            .rename(columns=present))
+
+
+def _add_depth(master: pd.DataFrame) -> pd.DataFrame:
+    """Cortical depth of each soma, in microns from the pia.
+
+    `depth` is named in the M0 technical block (docs/02 §2) but nothing produced it, and
+    `_columns_for` drops absent columns silently — so M0 was being fit almost empty, which inflates
+    every increment measured against it. Depth also carries the imaging-depth artifact that null N6
+    exists to rule out, so an absent depth column quietly removes that control too.
+
+    minnie65 is a slanted volume; `standard-transform` supplies the published nm -> depth transform.
+    """
+    if "pt_position" not in master.columns:
+        return master
+    pos = np.stack(master["pt_position"].apply(
+        lambda p: np.asarray(p, dtype=float) if p is not None else np.array([np.nan] * 3)
+    ).to_numpy())
+    try:
+        from standard_transform import minnie_transform
+
+        # pt_position is in voxels at the segmentation's 4x4x40 nm resolution.
+        tform = minnie_transform(resolution=[4, 4, 40])
+        master["depth"] = tform.apply(pos)[:, 1]   # column 1 is depth below pia, in microns
+    except Exception as e:  # noqa: BLE001
+        # Never silently continue without depth — M0 depends on it.
+        raise RuntimeError(
+            f"Could not compute cortical depth via standard-transform ({type(e).__name__}: {e}). "
+            "M0 needs it; fix the transform rather than dropping the column."
+        ) from e
+
+    d = master["depth"]
+    if not (d.between(0, 1200).mean() > 0.95):
+        raise RuntimeError(
+            f"Depths look wrong (median {d.median():.0f}um, range {d.min():.0f}-{d.max():.0f}). "
+            "Mouse V1 somas sit roughly 50-700um below pia; check the input resolution."
+        )
+    return master
 
 
 def _reduce(df: pd.DataFrame, key: str) -> pd.DataFrame:

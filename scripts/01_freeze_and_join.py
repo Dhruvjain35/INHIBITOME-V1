@@ -25,7 +25,7 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         provenance["query_timestamp_error"] = str(e)
 
-    (CFG.path("outputs") / "data_provenance.json").write_text(json.dumps(provenance, indent=2))
+    (CFG.path("outputs") / "data_provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
 
     paths = build_master(cave)
     print("Wrote:")

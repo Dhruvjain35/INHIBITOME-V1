@@ -36,6 +36,9 @@ _SYNAPSE_BATCH = 50
 # smaller chunks moments later.
 _REQUEST_TIMEOUT = (30, 300)  # (connect, read) seconds
 _MAX_ATTEMPTS = 3
+# Filter ids travel in the POST body, so this is bounded by nginx's body limit, not by rows.
+# 200,000 ids is ~4MB of JSON -> 413 Request Entity Too Large. 10,000 is ~200KB.
+_COMPARTMENT_CHUNK = 10_000
 
 
 class _TimeoutAdapter(HTTPAdapter):
@@ -209,30 +212,64 @@ class Cave:
         )
 
     def compartment_for(self, synapse_ids: Iterable[int], *,
-                        use_cache: bool = True, chunk: int = 200_000) -> pd.DataFrame:
+                        use_cache: bool = True, chunk: int = _COMPARTMENT_CHUNK) -> pd.DataFrame:
         """Compartment predictions for specific synapse ids.
 
         `synapse_target_predictions_ssa_v2` has 208,644,969 rows. Querying it unfiltered does not
         complete — it must always be restricted to the synapse ids we actually pulled.
+
+        The id list goes in the POST body, so the chunk size is bounded by nginx's request-body
+        limit, not by row count: 200,000 ids is ~4MB of JSON and returns
+        `413 Request Entity Too Large`. 10,000 ids is ~200KB, comfortably under.
         """
         ids = [int(i) for i in pd.unique(pd.Series(list(synapse_ids), dtype="int64"))]
-        name = CFG.table("synapse_compartment")
         frames: list[pd.DataFrame] = []
         chunks = list(_batched(ids, chunk))
         for i, part in enumerate(chunks):
-            cache = _cache_key("syn_comp", name=name, n=len(part), head=part[:3], tail=part[-3:])
+            cache = _cache_key("syn_comp", n=len(part), head=part[:3], tail=part[-3:])
             if use_cache and cache.exists():
                 frames.append(pd.read_parquet(cache))
                 continue
-            # target_id IS on the annotation model, so this one filters server-side.
-            df = self.client.materialize.query_table(
-                name, filter_in_dict={"target_id": part},
-                materialization_version=self.version,
-            )
+            df = self._compartment_query_bisect(part)
             df.to_parquet(cache)
             frames.append(df)
-            print(f"  compartments: chunk {i + 1}/{len(chunks)} (+{len(df):,})", flush=True)
+            if (i + 1) % 10 == 0 or i == len(chunks) - 1:
+                got = sum(len(f) for f in frames)
+                print(f"  compartments: chunk {i + 1}/{len(chunks)} ({got:,} rows)", flush=True)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    def _compartment_query_bisect(self, ids: list[int]) -> pd.DataFrame:
+        """Fetch compartment rows for these synapse ids, halving the request on failure.
+
+        Same shape as the synapse bisect: retry, then split. A 413 is deterministic — retrying an
+        oversized body never helps — so splitting is what actually resolves it.
+        """
+        # target_id IS on the annotation model, so this filters server-side (unlike pt_root_id).
+        last: Exception | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                return self.client.materialize.query_table(
+                    CFG.table("synapse_compartment"),
+                    filter_in_dict={"target_id": ids},
+                    materialization_version=self.version,
+                )
+            except Exception as e:  # noqa: BLE001
+                last = e
+                too_large = "413" in str(e)
+                if too_large or attempt == _MAX_ATTEMPTS - 1:
+                    break  # oversized bodies never succeed on retry — split instead
+                wait = 5 * 2 ** attempt
+                print(f"    retry {attempt + 1} on {len(ids)} synapse ids after "
+                      f"{type(e).__name__}; waiting {wait}s", flush=True)
+                time.sleep(wait)
+
+        if len(ids) == 1:
+            raise RuntimeError(f"compartment query failed for synapse id {ids[0]}") from last
+        mid = len(ids) // 2
+        return pd.concat(
+            [self._compartment_query_bisect(ids[:mid]), self._compartment_query_bisect(ids[mid:])],
+            ignore_index=True,
+        )
 
 
 def _mount_timeouts(client) -> None:

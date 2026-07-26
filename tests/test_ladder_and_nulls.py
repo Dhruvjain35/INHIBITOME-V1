@@ -4,6 +4,9 @@ test_core_logic.py covers the leaf functions; nothing there ever calls `run_ladd
 which is how three defects reached main. These tests exercise the two entry points that actually
 produce the confirmatory numbers, on synthetic data with a known planted effect.
 """
+import tempfile
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -27,7 +30,7 @@ def _synthetic(n=400, n_scans=8, effect=0.7, seed=0) -> pd.DataFrame:
         "layer": rng.choice(["L23", "L4", "L5"], n),
         "mtype": rng.choice(["23P", "4P", "5P"], n),
     })
-    for c in ["depth", "imaging_quality", "em_boundary_dist", "dendrite_length",
+    for c in ["depth", "coreg_score", "coreg_residual", "frac_typed", "dendrite_length",
               "baseline_activity", "tuning", "response_amplitude", "reliability",
               "total_exc_input", "total_inh_input", "inh_source_entropy"]:
         df[c] = rng.normal(size=n)
@@ -214,3 +217,44 @@ def test_itc_label_is_not_mistaken_for_inhibitory_by_prefix():
 def test_frac_typed_is_in_the_m0_technical_block():
     """Reconstruction completeness must be controlled for before any fingerprint credit."""
     assert "frac_typed" in FEATURE_BLOCKS["technical"]
+
+
+def test_m0_technical_columns_are_ones_the_pipeline_emits():
+    """M0's names must exist in the joined frame, or the technical baseline is fit on nothing."""
+    emitted = set(_synthetic().columns)
+    assert set(FEATURE_BLOCKS["technical"]) <= emitted, (
+        f"M0 names no emitted column: {set(FEATURE_BLOCKS['technical']) - emitted}")
+
+
+def test_gate_reads_the_raw_tag_column_the_join_actually_saves():
+    """The join stores `tag`; only build_fingerprints renames it. The gate must resolve either,
+    or it fails the pilot at 0.0% coverage against real data at 98.8%."""
+    from inhibitome.report.sample_accounting import sample_accounting
+
+    syn = pd.DataFrame({
+        "post_pt_root_id": [1] * 4,
+        "pre_pt_root_id": [10, 11, 12, 13],
+        "pre_ei": ["inhibitory_neuron"] * 4,
+        "tag": ["soma", "shaft", "spine", None],   # as saved by data/join.py
+    })
+    master = pd.DataFrame({"pt_root_id": [1], "session": [1], "scan_idx": [0], "frac_typed": [0.1]})
+    out = sample_accounting(master, syn, out_path=Path(tempfile.mkdtemp()) / "acc.md")
+    comp = out["checks"]["min_compartment_labeled_fraction"][0]
+    # 3 of 4 labelled: the None must count as missing, not as the string "<NA>".
+    assert comp == pytest.approx(0.75), f"compartment coverage read as {comp}, expected 0.75"
+
+
+def test_pandas_na_is_not_counted_as_a_label():
+    """astype(str) turns pandas NA into '<NA>'; the gate must not read that as a real label."""
+    from inhibitome.report.sample_accounting import _labeled_fraction
+
+    s = pd.DataFrame({"tag": pd.array(["soma", "shaft", None, None], dtype="string")})
+    assert _labeled_fraction(s, "tag") == pytest.approx(0.5)
+
+
+def test_empty_feature_block_raises_instead_of_collapsing():
+    """A block with no columns present must fail loudly, not report a false null."""
+    df = _synthetic().drop(columns=FEATURE_BLOCKS["inh_compartment"])
+    with pytest.raises(ValueError, match="no columns present"):
+        run_ladder(df, "target", scan_key=SCAN_KEY, group_key=GROUP_KEY,
+                   endpoint="state_modulation", n_boot=0, seed=1)

@@ -39,7 +39,7 @@ def main() -> int:
     # Freeze the pre-registration.
     lock = {"prereg_git_sha": _git_sha(), "materialization_version": CFG.materialization_version,
             "seed": CFG.seed}
-    (CFG.path("outputs") / "prereg_lock.json").write_text(json.dumps(lock, indent=2))
+    (CFG.path("outputs") / "prereg_lock.json").write_text(json.dumps(lock, indent=2), encoding="utf-8")
 
     df = _assemble()
     scan_key, group_key = CFG.validation["scan_key"], CFG.validation["group_key"]
@@ -61,9 +61,9 @@ def main() -> int:
         }
         results[endpoint] = {"r2": ladder.r2, "increments": ladder.increments, "nulls": nulls}
 
-    (CFG.path("outputs") / "blinded_comparison.md").write_text(_render(results))
+    (CFG.path("outputs") / "blinded_comparison.md").write_text(_render(results), encoding="utf-8")
     _write_decision(results)
-    print(open(CFG.path("outputs") / "DAY10_DECISION.md").read())
+    print(open(CFG.path("outputs") / "DAY10_DECISION.md", encoding="utf-8").read())
     return 0
 
 
@@ -105,7 +105,8 @@ def _write_decision(results: dict) -> None:
         f"# Day 10 Decision\n\n{verdict}\n\n"
         f"- state_modulation survives: {state_ok}\n"
         f"- reliability survives: {reliab_ok}\n\n"
-        f"See outputs/blinded_comparison.md for the numbers behind this.\n"
+        f"See outputs/blinded_comparison.md for the numbers behind this.\n",
+        encoding="utf-8",
     )
 
 
