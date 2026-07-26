@@ -99,14 +99,17 @@ def _annotate_synapses(cave: Cave, syn: pd.DataFrame) -> pd.DataFrame:
         ]
         syn = syn.merge(_reduce(pre_mt, "pre_pt_root_id"), on="pre_pt_root_id", how="left")
 
-    # Compartment prediction table is keyed by synapse id; merge on the shared id column.
-    comp = cave.query_table("synapse_compartment")
-    id_col = _first_present(comp, ["target_id", "id_ref", "synapse_id", "id"])
+    # Compartment predictions are keyed by synapse id. The table has 208.6M rows, so it is fetched
+    # ONLY for the synapse ids we actually pulled — an unfiltered query does not complete.
     syn_id = _first_present(syn, ["id", "synapse_id"])
-    if id_col and syn_id:
-        keep = [id_col] + [c for c in comp.columns if "compartment" in c.lower()
-                          or "target" in c.lower()]
-        syn = syn.merge(comp[keep].rename(columns={id_col: syn_id}), on=syn_id, how="left")
+    if syn_id:
+        comp = cave.compartment_for(syn[syn_id].dropna().astype("int64"))
+        id_col = _first_present(comp, ["target_id", "id_ref", "synapse_id", "id"])
+        if id_col:
+            keep = [id_col] + [c for c in comp.columns
+                               if "compartment" in c.lower() or "tag" in c.lower()]
+            comp = comp[keep].rename(columns={id_col: syn_id})
+            syn = syn.merge(_reduce(comp, syn_id), on=syn_id, how="left")
     return syn
 
 

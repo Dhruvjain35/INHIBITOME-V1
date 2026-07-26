@@ -19,7 +19,10 @@ from inhibitome.config import CFG
 
 
 # --- column resolution (schema literals vary by table version) ---------------
-_COMPARTMENT_COL = ["compartment", "pred_compartment", "target_compartment", "label"]
+# `tag` FIRST: that is the real column on synapse_target_predictions_ssa_v2 (verified 2026-07-26),
+# carrying 'soma' / 'shaft' / 'spine'. It was absent from this list, so _col() returned None and
+# every synapse fell through to "unknown" — silently zeroing every M4 compartment fraction.
+_COMPARTMENT_COL = ["compartment", "tag", "pred_compartment", "target_compartment", "label"]
 _PRECLASS_COL = ["pre_ei", "pre_cell_type", "pre_class"]
 # Fine presynaptic identity, for SOURCE composition/diversity (M5). Distinct from the coarse E/I
 # label above: entropy over pre_ei within inhibitory synapses is 0 for everyone (see data/join.py).
@@ -36,9 +39,18 @@ def _col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 def _map_compartment(raw: pd.Series) -> pd.Series:
     """Map raw spine/shaft/soma-style labels to our 5 compartments (config.compartments).
 
-    synapse_target_predictions_ssa gives spine/shaft/soma; combined with distance-to-soma we refine
-    into proximal/distal/apical. Here we do the coarse, robust mapping; the proximal/distal/apical
-    split is validated against allen_v1_column_types_slanted_ref before being trusted (docs/03).
+    ⚠️ HONEST LIMITATION — read before interpreting any M4 result.
+    `synapse_target_predictions_ssa_v2` supplies exactly three labels: 'soma', 'shaft', 'spine'
+    (verified 2026-07-26). That is a *structural-target* axis, NOT the radial soma→apical axis that
+    docs/02 M4 and the docs/00 §5 mechanistic hypothesis are written in terms of. Recovering
+    perisomatic / proximal / distal-basal / apical requires **distance-to-soma along the skeleton**
+    plus a basal/apical branch call — i.e. pcg-skel / meshparty skeletonization, which is not yet in
+    this pipeline.
+
+    Until that exists, the mapping below is a stand-in: shaft→proximal and spine→distal_basal are
+    naming conventions, not measured radial positions, and 'apical' will never be populated. An M4
+    built on it tests "soma vs shaft vs spine", which is a real and defensible question — but it is
+    not the pre-registered placement hypothesis, and must not be reported as though it were.
     """
     s = raw.astype(str).str.lower()
     out = pd.Series("unknown", index=raw.index)

@@ -24,6 +24,10 @@ CACHE_DIR = REPO_ROOT / "data" / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _SYNAPSE_QUERY_CAP = 500_000  # CAVE hard cap per query
+# Cohort neurons average ~3,000 incoming synapses (measured 2026-07-26 over 10 cohort cells:
+# mean 3,037, median 2,294, max 5,971), so the cap binds at ~164 post_ids. 100 leaves headroom
+# for hub neurons without making the pull needlessly chatty.
+_SYNAPSE_BATCH = 100
 
 
 def _cache_key(kind: str, **parts: Any) -> Path:
@@ -75,34 +79,74 @@ class Cave:
         df.to_parquet(cache)
         return df
 
-    def synapses_onto(self, root_ids: Iterable[int], *, use_cache: bool = True) -> pd.DataFrame:
-        """Incoming synapses for post-synaptic `root_ids` (chunked under the 500k cap).
+    def synapses_onto(self, root_ids: Iterable[int], *, use_cache: bool = True,
+                      batch_size: int = _SYNAPSE_BATCH, progress: bool = True) -> pd.DataFrame:
+        """Incoming synapses for post-synaptic `root_ids`, chunked under the 500k cap.
 
         Returns synapses_pni_2 rows: pre_pt_root_id, post_pt_root_id, positions, size.
+
+        Cohort neurons carry ~3,000 incoming synapses each (measured: median 2,294, max ~6,000), so
+        the cap binds at ~160 post_ids. We batch well under that and, on the rare batch that still
+        caps out, bisect rather than dropping to one-id-at-a-time — a 15k-neuron cohort would
+        otherwise become 15k round trips.
+
+        Each batch is cached separately, so a multi-hour pull resumes where it stopped instead of
+        restarting from zero.
         """
         root_ids = list(dict.fromkeys(int(r) for r in root_ids))  # de-dup, keep order
-        cache = _cache_key("syn_onto", n=len(root_ids),
-                          head=root_ids[:5], tail=root_ids[-5:])
-        if use_cache and cache.exists():
-            return pd.read_parquet(cache)
-
         frames: list[pd.DataFrame] = []
-        # Query per batch of post ids; if any single neuron approaches the cap, split it out.
-        for batch in _batched(root_ids, 200):
-            df = self.client.materialize.synapse_query(
-                post_ids=batch, materialization_version=self.version
-            )
-            if len(df) >= _SYNAPSE_QUERY_CAP:
-                # Fell into the cap: re-query these post ids one at a time to be safe.
-                df = pd.concat(
-                    [self.client.materialize.synapse_query(
-                        post_ids=[r], materialization_version=self.version) for r in batch],
-                    ignore_index=True,
-                )
+        batches = list(_batched(root_ids, batch_size))
+        for i, batch in enumerate(batches):
+            cache = _cache_key("syn_onto_batch", ids=batch)
+            if use_cache and cache.exists():
+                frames.append(pd.read_parquet(cache))
+                continue
+            df = self._synapse_query_bisect(batch)
+            df.to_parquet(cache)
             frames.append(df)
-        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        out.to_parquet(cache)
-        return out
+            if progress:
+                done = sum(len(f) for f in frames)
+                print(f"  synapses: batch {i + 1}/{len(batches)}  (+{len(df):,} -> {done:,} total)",
+                      flush=True)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    def _synapse_query_bisect(self, ids: list[int]) -> pd.DataFrame:
+        """Query these post_ids; a result at the row cap is truncated, so split and retry."""
+        df = self.client.materialize.synapse_query(
+            post_ids=ids, materialization_version=self.version
+        )
+        if len(df) < _SYNAPSE_QUERY_CAP or len(ids) == 1:
+            return df
+        mid = len(ids) // 2
+        return pd.concat(
+            [self._synapse_query_bisect(ids[:mid]), self._synapse_query_bisect(ids[mid:])],
+            ignore_index=True,
+        )
+
+    def compartment_for(self, synapse_ids: Iterable[int], *,
+                        use_cache: bool = True, chunk: int = 200_000) -> pd.DataFrame:
+        """Compartment predictions for specific synapse ids.
+
+        `synapse_target_predictions_ssa_v2` has 208,644,969 rows. Querying it unfiltered does not
+        complete — it must always be restricted to the synapse ids we actually pulled.
+        """
+        ids = [int(i) for i in pd.unique(pd.Series(list(synapse_ids), dtype="int64"))]
+        name = CFG.table("synapse_compartment")
+        frames: list[pd.DataFrame] = []
+        chunks = list(_batched(ids, chunk))
+        for i, part in enumerate(chunks):
+            cache = _cache_key("syn_comp", name=name, n=len(part), head=part[:3], tail=part[-3:])
+            if use_cache and cache.exists():
+                frames.append(pd.read_parquet(cache))
+                continue
+            df = self.client.materialize.query_table(
+                name, filter_in_dict={"target_id": part},
+                materialization_version=self.version,
+            )
+            df.to_parquet(cache)
+            frames.append(df)
+            print(f"  compartments: chunk {i + 1}/{len(chunks)} (+{len(df):,})", flush=True)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _batched(seq: list, n: int):

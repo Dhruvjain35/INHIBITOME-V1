@@ -138,6 +138,22 @@ def test_source_diversity_separates_diverse_from_single_source_neurons():
     assert fp.loc[201, "inh_dominant_source_frac"] == pytest.approx(1.0)
 
 
+def test_raw_ssa_tag_column_is_resolved():
+    """The live table calls it `tag` (soma/shaft/spine). If unresolved, every M4 fraction is 0."""
+    syn = pd.DataFrame({
+        "post_pt_root_id": [300] * 3,
+        "pre_pt_root_id": [1, 2, 3],
+        "pre_ei": ["inhibitory"] * 3,
+        "pre_mtype": ["BC", "MC", "BPC"],
+        "tag": ["soma", "shaft", "spine"],   # exactly what CAVE returns
+    })
+    fp = build_fingerprints(syn, pilot=True).iloc[0]
+    assert fp["inh_frac_unknown"] == pytest.approx(0.0), "tag column not resolved"
+    assert fp["inh_frac_soma"] == pytest.approx(1 / 3)
+    assert fp["inh_frac_proximal"] == pytest.approx(1 / 3)      # shaft
+    assert fp["inh_frac_distal_basal"] == pytest.approx(1 / 3)  # spine
+
+
 def test_coarse_only_labels_give_nan_not_a_fake_zero():
     """Without pre_mtype, source diversity is undefined -- must not read as 'no signal'."""
     syn = _syn_table().drop(columns=["pre_mtype"])
