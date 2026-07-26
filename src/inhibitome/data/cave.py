@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+from requests.adapters import HTTPAdapter
 
 from inhibitome.config import CFG, REPO_ROOT
 
@@ -25,9 +27,24 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _SYNAPSE_QUERY_CAP = 500_000  # CAVE hard cap per query
 # Cohort neurons average ~3,000 incoming synapses (measured 2026-07-26 over 10 cohort cells:
-# mean 3,037, median 2,294, max 5,971), so the cap binds at ~164 post_ids. 100 leaves headroom
-# for hub neurons without making the pull needlessly chatty.
-_SYNAPSE_BATCH = 100
+# mean 3,037, median 2,294, max 5,971), so the cap binds at ~164 post_ids. Measured timings on
+# cohort ids: 5 -> 5.9s, 20 -> 16.1s, 50 -> 29.4s (~0.6s/neuron). 50 keeps each request short
+# enough to survive a gateway hiccup; a 100-id request stalled indefinitely in a real run.
+_SYNAPSE_BATCH = 50
+# No timeout means one hung connection blocks a six-hour job forever — which is exactly what
+# happened: batch 2 sat for 59 minutes on 2.6s of CPU while the same ids answered fine in
+# smaller chunks moments later.
+_REQUEST_TIMEOUT = (30, 300)  # (connect, read) seconds
+_MAX_ATTEMPTS = 3
+
+
+class _TimeoutAdapter(HTTPAdapter):
+    """requests has no default-timeout setting; inject one on every call through this adapter."""
+
+    def send(self, request, **kwargs):
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = _REQUEST_TIMEOUT
+        return super().send(request, **kwargs)
 
 
 def _cache_key(kind: str, **parts: Any) -> Path:
@@ -53,6 +70,7 @@ class Cave:
 
             c = CAVEclient(self.datastack)
             c.version = self.version  # pin materialization for reproducibility
+            _mount_timeouts(c)
             self._client = c
         return self._client
 
@@ -158,12 +176,32 @@ class Cave:
         return syn, degree
 
     def _synapse_query_bisect(self, ids: list[int]) -> pd.DataFrame:
-        """Query these post_ids; a result at the row cap is truncated, so split and retry."""
-        df = self.client.materialize.synapse_query(
-            post_ids=ids, materialization_version=self.version
-        )
-        if len(df) < _SYNAPSE_QUERY_CAP or len(ids) == 1:
-            return df
+        """Query these post_ids, splitting on either the row cap or a failure.
+
+        Two reasons to bisect. A result AT the cap is silently truncated, so it must be split to be
+        correct. And a request that times out or errors is retried a few times, then split — a
+        smaller request usually succeeds where a larger one hung, and halving beats collapsing to
+        one-id-at-a-time (a 15k cohort would become 15k round trips).
+        """
+        last: Exception | None = None
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                df = self.client.materialize.synapse_query(
+                    post_ids=ids, materialization_version=self.version
+                )
+                if len(df) < _SYNAPSE_QUERY_CAP or len(ids) == 1:
+                    return df
+                break  # hit the cap: fall through and split
+            except Exception as e:  # noqa: BLE001 — transport/server errors are all retryable here
+                last = e
+                if attempt < _MAX_ATTEMPTS - 1:
+                    wait = 5 * 2 ** attempt
+                    print(f"    retry {attempt + 1}/{_MAX_ATTEMPTS - 1} on {len(ids)} ids after "
+                          f"{type(e).__name__}; waiting {wait}s", flush=True)
+                    time.sleep(wait)
+
+        if len(ids) == 1:
+            raise RuntimeError(f"synapse_query failed for post_id {ids[0]}") from last
         mid = len(ids) // 2
         return pd.concat(
             [self._synapse_query_bisect(ids[:mid]), self._synapse_query_bisect(ids[mid:])],
@@ -195,6 +233,24 @@ class Cave:
             frames.append(df)
             print(f"  compartments: chunk {i + 1}/{len(chunks)} (+{len(df):,})", flush=True)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _mount_timeouts(client) -> None:
+    """Give every CAVE sub-client's session a request timeout.
+
+    CAVEclient builds several sub-clients, each with its own requests.Session and no default
+    timeout, so any of them can hang forever on a dropped connection.
+    """
+    seen = set()
+    for attr in ("materialize", "chunkedgraph", "annotation", "auth", "info", "l2cache", "state"):
+        sub = getattr(client, attr, None)
+        session = getattr(sub, "session", None)
+        if session is None or id(session) in seen:
+            continue
+        seen.add(id(session))
+        adapter = _TimeoutAdapter(max_retries=0)  # retries handled by the caller, with bisection
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
 
 
 def _batched(seq: list, n: int):
