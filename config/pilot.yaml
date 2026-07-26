@@ -6,31 +6,44 @@
 # prereg freeze (docs/02) invalidates the confirmatory run — start a new config
 # file (pilot_v2.yaml) instead of editing this one in place.
 #
-# All strings below were verified against the MICrONS tutorial / CAVE docs
-# (July 2026). See docs/01_DATA_ACCESS.md for source URLs and caveats.
+# All strings below were ENUMERATED AGAINST THE LIVE API on 2026-07-26 (not just read from
+# docs): every name below is confirmed present at the pinned version. See docs/01_DATA_ACCESS.md.
 # ============================================================================
 
 data:
   datastack: minnie65_public          # CAVEclient('minnie65_public')
 
-  # Pin ONE materialization for the whole pilot. Live public versions (Mar 2026):
-  #   117(2021) 943(2024) 1300(2025) 1507(2025) 1621(2025) 1718(2026)
-  # Expired (static download only): 343 661 795 1078 1181 1412
-  # We pin 1300 (Jan 2025): stable, well-documented, and the 2025 census +
-  # synapse-target releases are materialized in it. Bump only with a new config.
-  materialization_version: 1300
+  # Pin ONE materialization for the whole pilot. Live public versions (2026-07-26, enumerated):
+  #   117 943 1300 1507 1621 1718 1822
+  #
+  # We pin 1822 (2026-06-27). The original pin of 1300 (2025-01-13) was INCONSISTENT with this
+  # file: digital_twin_properties_bcm_coreg_v4 does not exist at 1300 (it is 1822-only), so the
+  # M2 functional baseline could not have been built. Corrected before the prereg freeze, before
+  # any data was pulled — no confirmatory result is invalidated. Measured at 1822 vs 1300:
+  #   visual-tuning coverage of the cohort  67% -> 85%  (10,348 -> 13,087 neurons)
+  #   compartment predictions               204.3M -> 208.6M rows (ssa_v2)
+  #   proofread cells                       1,865 -> 2,334
+  #   cohort itself                         unchanged (19,181 ROIs / 15,434 roots / 16 scans)
+  # 1822 also expires latest (~mid-2028), which matters for a project targeting publication.
+  # Bump only with a new config once docs/02 is tagged prereg-frozen.
+  materialization_version: 1822
 
   tables:
     # --- connectivity ---
     synapses: synapses_pni_2                       # ~337M rows; 500k/query cap
-    synapse_compartment: synapse_target_predictions_ssa   # ~204M spine/shaft/soma preds
+    synapse_compartment: synapse_target_predictions_ssa_v2  # 208.6M spine/shaft/soma preds
 
     # --- cell identity ---
     ei_coarse: baylor_log_reg_cell_type_coarse_v1  # excitatory vs inhibitory
     ei_meta: aibs_metamodel_celltypes_v661         # broad-coverage soma/nucleus classifier
     mtypes: aibs_metamodel_mtypes_v661_v2          # data-driven morphological types
-    mtypes_column: allen_column_mtypes_v1          # within-V1-column m-types
+    mtypes_column: allen_column_mtypes_v2          # within-V1-column m-types (v1 does not exist)
     manual_column: allen_v1_column_types_slanted_ref  # expert-curated column cells (validation)
+
+    # Corrections to the metamodel calls, released alongside 1822. The m-type label is
+    # load-bearing for M5 source diversity, so these are applied before fingerprinting.
+    ei_meta_corrections: aibs_metamodel_celltypes_v661_corrections
+    mtypes_corrections: aibs_metamodel_mtypes_v661_v2_corrections
 
     # --- nucleus / soma / area ---
     nucleus: nucleus_detection_v0
@@ -43,7 +56,10 @@ data:
     # --- functional coregistration (EM <-> two-photon) ---
     coreg_manual: coregistration_manual_v4         # PRIMARY cohort: 15,352 roots / 19,181 ROIs
     coreg_auto: coregistration_auto_phase3_fwd_apl_vess_combined_v2   # secondary / expansion
-    func_properties: digital_twin_properties_bcm_coreg_v4  # tuning/orientation on manual coreg
+    # Tuning/orientation on the manual-coreg cohort: pref_ori, pref_dir, gOSI, gDSI, OSI, DSI,
+    # cc_abs, cc_max, cc_norm, readout_loc_x/y. cc_norm is the released normalized-correlation
+    # score — a CROSS-CHECK for our own oracle R_i (docs/01 §5), never a substitute for it.
+    func_properties: digital_twin_properties_bcm_coreg_v4
 
   # Functional activity + behavior + repeated-movie ("oracle") stimuli are NOT
   # in CAVE — they live in NWB on DANDI. Downloaded separately (see docs/01).
