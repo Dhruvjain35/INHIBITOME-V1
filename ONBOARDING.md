@@ -82,15 +82,52 @@ and re-running resumes rather than restarting. `make clean` drops the cache and 
 
 ## Current status & next step
 
-Scaffold complete; plan in `docs/`; **23 unit tests green**; config verified against the live API
-(all 16 tables exist at materialization **1822**). The Days 1–2 join runs end-to-end.
+**Days 1–2 are done and the Day-3 DATA GATE PASSES.** 27 unit tests green. Config verified against
+the live API — all 16 tables exist at materialization **1822**.
 
-Next real work is the **Day-3 DATA GATE** (`scripts/02`), then **Days 4–5** — which needs the DANDI
-download and the NWB schema resolved (item 2 above). If a gate fails, go straight to
-`docs/04_KILL_AND_SUCCESS.md` — a clean kill is a legitimate outcome.
+| gate check | value | threshold |
+|---|---|---|
+| coregistered excitatory neurons | **15,282** | ≥ 1,000 |
+| functional scans | **16** | ≥ 10 |
+| neurons with a fingerprint | **15,223** | ≥ 300 |
+| compartment labels | **98.8%** | ≥ 50% |
 
-Cohort as measured: **19,181 ROIs / 15,434 roots / 16 scans**, comfortably past the gate's ≥1,000
-neurons and ≥10 scans. Median typed inhibitory input is ~129 synapses/neuron.
+Master table: 19,004 ROI rows / 15,282 neurons (V1 13,059 · RL 4,710 · AL 1,211 · LM 24). Pulled
+4,925,938 typed synapses out of 52,347,211 total. Typed inhibitory input per neuron: median 181,
+q25 120, q75 260, max 4,502. Note **LM has only 24 ROIs** — too few for area-stratified claims.
+
+### To pick this up
+
+1. `uv sync --extra dev`, then mint a CAVE token (`scripts/00_setup_cave_token.py`, needs a real
+   terminal — it prompts).
+2. **`data/` is gitignored, so the pull does not come with the repo.** Re-running
+   `scripts/01_freeze_and_join.py` takes ~4h against CAVE and is resumable per batch. Copying a
+   collaborator's `data/cache/` directory across is far faster and is exactly equivalent —
+   everything in it is keyed by materialization version.
+3. `scripts/02_sample_accounting.py` should reproduce the table above.
+
+### Next real work: Days 4–5 (`scripts/03`)
+
+Needs `dandi download DANDI:000402` and the NWB internal schema resolved against a real file —
+`data/functional.py` raises `NotImplementedError` until then. That is the last genuine unknown in
+the pipeline.
+
+### Open decisions, deliberately not made
+
+- **`synapse_target_predictions_ssa_v2` is flagged by its owners as "Table in development…
+  Citation forthcoming, reach out if wanting to use for publication."** It is the basis of M4. The
+  v1 table (`synapse_target_predictions_ssa`, 204.3M rows) is the published one behind the 2025
+  census and also exists at 1822, so switching costs nothing on the version pin. For a
+  publication target, v1 as primary and v2 as a robustness check is the safer shape.
+- **`test_retest` correlates a 3-element coefficient vector per neuron.** A correlation over three
+  points is close to meaningless; the docs/02 §6 gate (`Corr ≥ 0.30`) more plausibly means
+  correlating `M_i` *across neurons* between time blocks.
+- **`scripts/05` uses `loco_given_pupil` as the headline `M_i`**, but docs/02 §1 defines the primary
+  endpoint as state-dependent visual *gain* — that is `multiplicative_gain`. The prereg and the code
+  currently disagree about the primary endpoint.
+
+All three are cheap to change now and awkward after the `prereg-frozen` tag (which does not yet
+exist — nothing is actually frozen).
 
 ## Ground rules (from the pre-registration)
 
