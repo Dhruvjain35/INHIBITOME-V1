@@ -13,6 +13,9 @@ dependencies = [
   "standard-transform",  # cortical depth / layer transforms for minnie65
   "cloud-volume",        # meshes / imagery (only if needed for QC)
   "nglui",               # neuroglancer link building for figures/QC
+  # --- functional plane: DANDI 000402 NWB (docs/01 §4; NOT in CAVE) ---
+  "pynwb",               # read the NWB files (data/functional.py imports this)
+  "dandi",               # `dandi download DANDI:000402`
   # --- scientific stack ---
   "numpy",
   "pandas",

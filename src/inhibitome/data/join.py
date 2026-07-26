@@ -71,7 +71,15 @@ def _excitatory_root_ids(ei: pd.DataFrame) -> list[int]:
 
 
 def _annotate_synapses(cave: Cave, syn: pd.DataFrame) -> pd.DataFrame:
-    """Attach pre-synaptic E/I label and post-synaptic compartment prediction to each synapse."""
+    """Attach pre-synaptic class labels and the post-synaptic compartment prediction per synapse.
+
+    TWO presynaptic labels, kept separate on purpose (docs/00 Aim 2: "broad *and* fine labels kept
+    separate"):
+      pre_ei    — coarse excitatory/inhibitory, used to decide which synapses are inhibitory at all;
+      pre_mtype — fine morphological type, used for SOURCE composition and diversity (M5).
+    The fine label is not optional: source entropy computed over `pre_ei` within the inhibitory
+    synapses is identically zero for every neuron, which would make M5 untestable by construction.
+    """
     if syn.empty:
         return syn
     pre_ids = syn["pre_pt_root_id"].dropna().astype("int64").unique().tolist()
@@ -81,6 +89,15 @@ def _annotate_synapses(cave: Cave, syn: pd.DataFrame) -> pd.DataFrame:
         ["pre_pt_root_id", "pre_ei"]
     ]
     syn = syn.merge(pre_ei, on="pre_pt_root_id", how="left")
+
+    # Fine presynaptic m-type (the interneuron classes M5 is actually about).
+    pre_mt = cave.query_table("mtypes", filter_in={"pt_root_id": pre_ids})
+    mt_col = _first_present(pre_mt, ["cell_type", "pred_cell_type", "mtype", "class"])
+    if mt_col is not None:
+        pre_mt = pre_mt.rename(columns={"pt_root_id": "pre_pt_root_id", mt_col: "pre_mtype"})[
+            ["pre_pt_root_id", "pre_mtype"]
+        ]
+        syn = syn.merge(_reduce(pre_mt, "pre_pt_root_id"), on="pre_pt_root_id", how="left")
 
     # Compartment prediction table is keyed by synapse id; merge on the shared id column.
     comp = cave.query_table("synapse_compartment")

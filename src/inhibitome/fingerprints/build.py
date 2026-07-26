@@ -21,6 +21,9 @@ from inhibitome.config import CFG
 # --- column resolution (schema literals vary by table version) ---------------
 _COMPARTMENT_COL = ["compartment", "pred_compartment", "target_compartment", "label"]
 _PRECLASS_COL = ["pre_ei", "pre_cell_type", "pre_class"]
+# Fine presynaptic identity, for SOURCE composition/diversity (M5). Distinct from the coarse E/I
+# label above: entropy over pre_ei within inhibitory synapses is 0 for everyone (see data/join.py).
+_PRESOURCE_COL = ["pre_mtype", "pre_cell_type", "pre_class"]
 
 
 def _col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -60,15 +63,24 @@ def build_fingerprints(
 ) -> pd.DataFrame:
     """One row of inhibitory-fingerprint features per post-synaptic root id.
 
-    `synapses` is data/processed/incoming_synapses.parquet (pre_ei + compartment already attached in
-    data/join.py). `dendrite_length` (optional, indexed by root id) enables per-unit-length
-    normalization; if absent, we fall back to total-input normalization only.
+    `synapses` is data/processed/incoming_synapses.parquet (pre_ei, pre_mtype and compartment
+    already attached in data/join.py). `dendrite_length` (optional, indexed by root id) enables
+    per-unit-length normalization; if absent, we fall back to total-input normalization only.
+
+    `pilot=True` reserves the *motif* block (shared/convergent/disinhibitory structure) for full
+    development (docs/03 Days 6-7). It does NOT gate the amount/location/source/diversity blocks —
+    all of those are needed for the M0..M5 ladder to mean what docs/02 says it means.
     """
     df = synapses.copy()
     pre_col = _col(df, _PRECLASS_COL)
+    src_col = _col(df, _PRESOURCE_COL)
     comp_col = _col(df, _COMPARTMENT_COL)
     if pre_col is None:
         raise ValueError(f"No presynaptic class column found in {list(df.columns)}")
+    if src_col == pre_col:
+        # Only the coarse E/I label is available: source diversity would be a constant 0. Emit the
+        # columns as NaN rather than as a fake zero, so the ladder can't read "no source signal".
+        src_col = None
 
     df["is_inh"] = _is_inhibitory(df[pre_col])
     df["compartment"] = (
@@ -107,12 +119,15 @@ def build_fingerprints(
         feat["inh_frac_perisomatic"] = comp_frac.get("soma", 0.0) + comp_frac.get("proximal", 0.0)
         feat["inh_frac_dendritic"] = comp_frac.get("distal_basal", 0.0) + comp_frac.get("apical", 0.0)
 
-        # --- source composition + diversity ---
-        if n_inh and not pilot:
-            src = _fractions(inh[pre_col], sorted(inh[pre_col].dropna().unique()))
-            feat["inh_source_entropy"] = _entropy(list(src.values()))
-            feat["inh_dominant_source_frac"] = max(src.values()) if src else np.nan
-            feat["inh_effective_n_classes"] = _effective_n(list(src.values()))
+        # --- source composition + diversity (M5) ---
+        # Always emitted, including in the pilot: M5 is DEFINED by these columns, and _columns_for
+        # silently skips absent ones, so omitting them would collapse M5 onto M4 and make the
+        # pre-registered "does source identity matter?" test read as a null result (docs/02 §2).
+        src = (_fractions(inh[src_col], sorted(inh[src_col].dropna().unique()))
+               if n_inh and src_col else {})
+        feat["inh_source_entropy"] = _entropy(list(src.values())) if src else np.nan
+        feat["inh_dominant_source_frac"] = max(src.values()) if src else np.nan
+        feat["inh_effective_n_classes"] = _effective_n(list(src.values())) if src else np.nan
         comp_vals = list(comp_frac.values())
         feat["inh_compartment_entropy"] = _entropy(comp_vals)
         rows.append(feat)
